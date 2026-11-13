@@ -75,7 +75,7 @@ fn csum_failure_counted_once_across_overlapping_ranges() {
         ctx.reader.base_offset(),
         ctx.strategy,
         ctx.superblock.devid,
-        ctx.superblock.fsid,
+        ctx.superblock.expected_metadata_uuid(),
         ctx.chunk_map.clone(),
         csum_root,
     );
@@ -123,7 +123,7 @@ fn csum_failure_counted_once_across_overlapping_ranges() {
         ctx_ok.reader.base_offset(),
         ctx_ok.strategy,
         ctx_ok.superblock.devid,
-        ctx_ok.superblock.fsid,
+        ctx_ok.superblock.expected_metadata_uuid(),
         ctx_ok.chunk_map.clone(),
         ctx_ok.roots.csum_root,
     );
@@ -168,7 +168,7 @@ fn stale_csum_branch_counted_once_per_run() {
     let ctx = scrub_rs::btrfs::open(&img_str, 0).expect("open freshly-formatted image");
     let csum_root = ctx.roots.csum_root;
     let node_size = ctx.superblock.node_size as usize;
-    let fsid = ctx.superblock.fsid;
+    let metadata_uuid = ctx.superblock.expected_metadata_uuid();
     assert!(csum_root != 0, "freshly-formatted fs must have a csum root");
 
     // Find a free node slot adjacent to the csum root (all-zero block on
@@ -219,7 +219,7 @@ fn stale_csum_branch_counted_once_per_run() {
 
         // Hand-build the child leaf header + one EXTENT_CSUM item.
         let mut child = vec![0u8; node_size];
-        child[32..48].copy_from_slice(&fsid);
+        child[32..48].copy_from_slice(&metadata_uuid);
         child[48..56].copy_from_slice(&child_logical.to_le_bytes());
         child[56..64].copy_from_slice(&root_flags.to_le_bytes());
         child[64..80].copy_from_slice(&chunk_tree_uuid);
@@ -270,7 +270,7 @@ fn stale_csum_branch_counted_once_per_run() {
         ctx.reader.base_offset(),
         ctx.strategy,
         ctx.superblock.devid,
-        ctx.superblock.fsid,
+        ctx.superblock.expected_metadata_uuid(),
         ctx.chunk_map.clone(),
         csum_root,
     );

@@ -59,13 +59,13 @@ impl LazyCsumProvider {
         base_offset: u64,
         strategy: CsumStrategy,
         devid: u64,
-        fsid: [u8; 16],
+        metadata_uuid: [u8; 16],
         chunk_map: ChunkMap,
         csum_root: u64,
     ) -> Self {
         let reader = FsReader::new(file, node_size, base_offset, Some(strategy))
             .with_devid(devid)
-            .with_fsid(fsid);
+            .with_fsid(metadata_uuid);
         Self {
             reader,
             chunk_map,

@@ -72,7 +72,7 @@ impl BtrfsScrub {
             reader.base_offset(),
             strategy,
             superblock.devid,
-            superblock.fsid,
+            superblock.expected_metadata_uuid(),
             chunk_map.clone(),
             roots.csum_root,
         );
@@ -258,6 +258,15 @@ impl fs::FilesystemScrub for BtrfsScrub {
             ),
             format!("magic         : {:?}", sb.magic),
             format!("fsid          : {}", crate::btrfs::util::hex(&sb.fsid)),
+            format!(
+                "metadata_uuid (raw): {}",
+                crate::btrfs::util::hex(&sb.metadata_uuid)
+            ),
+            format!(
+                "metadata_uuid (expected): {}",
+                crate::btrfs::util::hex(&sb.expected_metadata_uuid())
+            ),
+            format!("incompat_flags: 0x{:x}", sb.incompat_flags),
             format!("bytenr        : 0x{:x}", sb.bytenr),
             format!("generation   : {}", sb.generation),
             format!("root          : 0x{:x}", sb.root),
@@ -310,7 +319,7 @@ impl BtrfsReconfirmer {
             Some(scrub.strategy),
         )
         .with_devid(scrub.superblock.devid)
-        .with_fsid(scrub.superblock.fsid);
+        .with_fsid(scrub.superblock.expected_metadata_uuid());
         Ok(Self {
             reader,
             chunk_map: scrub.chunk_map.clone(),

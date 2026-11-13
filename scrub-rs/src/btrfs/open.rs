@@ -115,7 +115,7 @@ pub fn open(dev: &str, base_offset: u64) -> io::Result<BtrfsContext> {
         Some(strategy),
     )
     .with_devid(superblock.devid)
-    .with_fsid(superblock.fsid);
+    .with_fsid(superblock.expected_metadata_uuid());
 
     let mut chunk_records: Vec<ChunkRecord> = Vec::new();
     let mut metadata_header_errors: u64 = 0;
