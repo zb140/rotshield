@@ -102,6 +102,11 @@ pub trait ScrubCallbacks {
     /// Receive the recovery payload for one mismatched sector.
     fn on_event(&mut self, ev: &ScrubEvent);
 
+    /// Optional per-run cancellation token shared with the recovery pipeline.
+    fn cancellation_token(&self) -> Option<crate::cancel::CancelToken> {
+        None
+    }
+
     /// True when the sink classifies mismatches itself (deferred
     /// re-confirmation); the scrub then emits every mismatch raw.
     fn wants_raw_candidates(&self) -> bool {

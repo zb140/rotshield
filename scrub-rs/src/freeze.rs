@@ -3,7 +3,7 @@
 //! Recovery writes go to the raw rdev while the filesystem is mounted;
 //! freezing it (FIFREEZE) for the duration of one batch's reconfirm+write
 //! keeps scrub-rs the only writer to those bytes. Thaw is guaranteed by
-//! layers: RAII guard, panic hook, signal handlers, and a recorded FITHAW
+//! layers: RAII guard, panic hook, cooperative signal cancellation, and a recorded FITHAW
 //! failure that aborts the run with the manual `fsfreeze -u` command.
 
 use std::io;
@@ -56,7 +56,6 @@ impl FreezeController {
                 self.frozen = true;
                 note_active_mount(mountpoint);
                 install_panic_hook();
-                install_signal_handlers();
                 Ok(Some(FreezeGuard { controller: self }))
             }
             Err(e) => Err(e),
@@ -134,46 +133,8 @@ fn install_panic_hook() {
     }));
 }
 
-extern "C" fn signal_thaw_handler(sig: libc::c_int) {
-    if let Some(mnt) = ACTIVE_FREEZE_MOUNT.lock().ok().and_then(|g| g.clone())
-        && thaw_path(Path::new(&mnt)).is_ok()
-    {
-        clear_active_mount();
-    }
-
-    unsafe {
-        let mut action: libc::sigaction = std::mem::zeroed();
-        action.sa_sigaction = libc::SIG_DFL;
-        libc::sigemptyset(&mut action.sa_mask);
-        libc::sigaction(sig, &action, std::ptr::null_mut());
-        libc::raise(sig);
-    }
-}
-
-fn install_signal_handlers() {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static INSTALLED: AtomicBool = AtomicBool::new(false);
-    if INSTALLED.swap(true, Ordering::SeqCst) {
-        return;
-    }
-    use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
-    let action = SigAction::new(
-        SigHandler::Handler(signal_thaw_handler),
-        SaFlags::empty(),
-        SigSet::empty(),
-    );
-    for sig in [Signal::SIGTERM, Signal::SIGINT] {
-        if let Err(e) = unsafe { sigaction(sig, &action) } {
-            eprintln!(
-                "WARNING: could not install {sig:?} thaw handler: {e} — a kill mid-freeze \
-                 may leave the filesystem frozen (scrub.sh stop() still attempts fsfreeze -u)"
-            );
-        }
-    }
-}
-
 /// Tracks the mountpoint of the currently-held freeze so the panic hook
-/// and signal handler can thaw it as a last resort.
+/// and panic hook can thaw it as a last resort.
 static ACTIVE_FREEZE_MOUNT: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 
 /// Record the active freeze mountpoint (called by guard() on success).
@@ -266,6 +227,10 @@ mod tests {
             ACTIVE_FREEZE_MOUNT.lock().unwrap().is_some(),
             "active-freeze marker must stay set after a failed thaw"
         );
+
+        // This test deliberately simulates an unrecoverable thaw failure.
+        // Clear its synthetic global marker before returning.
+        clear_active_mount();
     }
 
     #[test]
@@ -280,16 +245,38 @@ mod tests {
     }
 
     #[test]
-    fn signal_handlers_install_once_without_breaking_normal_operation() {
-        install_signal_handlers();
-        install_signal_handlers();
-    }
-
-    #[test]
     fn no_mount_controller_never_frozen() {
         let mut c = FreezeController::new(None);
         assert!(!c.has_live_mount());
         assert!(c.guard().unwrap().is_none());
         assert!(c.take_thaw_error().is_none());
+    }
+
+    #[test]
+    #[ignore = "requires mounted disposable Btrfs fixture and root"]
+    fn live_freeze_thaw_smoke_test() {
+        use std::io::Write;
+
+        let testdir = std::fs::read_to_string("/tmp/scrub-rs-parity-testdir")
+            .expect("missing parity fixture pointer");
+        let mountpoint = std::path::PathBuf::from(testdir.trim()).join("mnt");
+
+        assert!(mountpoint.is_dir(), "fixture mountpoint does not exist");
+
+        let mut controller = super::FreezeController::new(Some(mountpoint.clone()));
+
+        {
+            let guard = controller.guard().expect("FIFREEZE failed");
+            assert!(guard.is_some(), "expected an active freeze guard");
+        }
+
+        assert!(controller.take_thaw_error().is_none(), "FITHAW failed");
+
+        let probe = mountpoint.join(".freeze-thaw-probe");
+        let mut file = std::fs::File::create(&probe).expect("filesystem not writable after thaw");
+        file.write_all(b"thaw verified\n")
+            .expect("write failed after thaw");
+        file.sync_all().expect("sync failed after thaw");
+        std::fs::remove_file(&probe).expect("probe cleanup failed");
     }
 }

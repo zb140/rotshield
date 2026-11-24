@@ -14,6 +14,44 @@ use crate::fs::{Reconfirm, ReconfirmRequest, Reconfirmer, SectorVerifier};
 use crate::recovery::{RecoveryInput, RecoveryResult, recover_block};
 use crate::status::StatusCounters;
 
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TestFault {
+    None,
+    Write,
+    CacheFlush,
+    Readback,
+    ReadbackIo,
+    Thaw,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_FAULT: std::cell::Cell<TestFault> =
+        const { std::cell::Cell::new(TestFault::None) };
+}
+
+#[cfg(test)]
+struct TestFaultGuard(TestFault);
+
+#[cfg(test)]
+impl TestFaultGuard {
+    fn new(fault: TestFault) -> Self {
+        let previous = TEST_FAULT.with(|current| {
+            let previous = current.get();
+            current.set(fault);
+            previous
+        });
+        Self(previous)
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestFaultGuard {
+    fn drop(&mut self) {
+        TEST_FAULT.with(|current| current.set(self.0));
+    }
+}
 /// One mismatched sector queued for recovery.
 #[derive(Clone)]
 pub struct Candidate {
@@ -101,6 +139,7 @@ pub fn spawn_pipeline(
     batch_idle: Duration,
     freeze_timeout: Duration,
     counters: Option<Arc<StatusCounters>>,
+    cancel: crate::cancel::CancelToken,
 ) -> io::Result<(
     SyncSender<Msg>,
     std::thread::JoinHandle<()>,
@@ -126,6 +165,7 @@ pub fn spawn_pipeline(
                 dry_run,
                 freeze_timeout,
                 counters.as_deref(),
+                cancel,
             )
         })
         .expect("spawn scrub-writer thread");
@@ -161,14 +201,8 @@ fn run_accumulator(
                 return;
             }
             Err(_) => {
-                if !batch.is_empty()
-                    && tx_b
-                        .send(BatchMsg::Batch(std::mem::take(&mut batch)))
-                        .is_err()
-                {
-                    return;
-                }
-                let _ = tx_b.send(BatchMsg::Done);
+                // The scrub ended without Done. Discard the unfinished batch;
+                // an unsuccessful scan must not initiate additional repairs.
                 return;
             }
         }
@@ -190,14 +224,7 @@ fn run_accumulator(
                 // Batch filled the idle window — send what we have.
                 Err(RecvTimeoutError::Timeout) => break,
                 Err(RecvTimeoutError::Disconnected) => {
-                    if !batch.is_empty()
-                        && tx_b
-                            .send(BatchMsg::Batch(std::mem::take(&mut batch)))
-                            .is_err()
-                    {
-                        return;
-                    }
-                    let _ = tx_b.send(BatchMsg::Done);
+                    // No successful completion signal: discard pending candidates.
                     return;
                 }
             }
@@ -225,14 +252,29 @@ fn run_writer(
     dry_run: bool,
     freeze_timeout: Duration,
     counters: Option<&StatusCounters>,
+    cancel: crate::cancel::CancelToken,
 ) -> io::Result<BatchStats> {
     let mut stats = BatchStats::default();
 
     let mut pending: Vec<Candidate> = Vec::new();
 
     loop {
+        if cancel.requested() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "recovery cancelled before starting another batch",
+            ));
+        }
+
         match rx.recv() {
             Ok(BatchMsg::Batch(batch)) => {
+                if cancel.requested() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "recovery cancelled before processing queued batch",
+                    ));
+                }
+
                 // Deferred candidates from freeze-timeouts are prepended to the next flush.
                 pending.extend(batch);
                 if let Err(e) = flush_pending(
@@ -245,13 +287,22 @@ fn run_writer(
                     freeze_timeout,
                     counters,
                     &mut stats,
+                    &cancel,
                 ) {
+                    cancel.request();
                     eprintln!("error: recovery pipeline aborted: {e}");
                     return Err(e);
                 }
             }
-            Ok(BatchMsg::Done) | Err(_) => {
+            Ok(BatchMsg::Done) => {
                 while !pending.is_empty() {
+                    if cancel.requested() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            "recovery cancelled while draining deferred candidates",
+                        ));
+                    }
+
                     if let Err(e) = flush_pending(
                         &mut pending,
                         &cfg,
@@ -262,12 +313,30 @@ fn run_writer(
                         freeze_timeout,
                         counters,
                         &mut stats,
+                        &cancel,
                     ) {
+                        cancel.request();
                         eprintln!("error: recovery pipeline aborted: {e}");
                         return Err(e);
                     }
                 }
+
+                if cancel.requested() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "recovery cancelled before completion",
+                    ));
+                }
+
                 return Ok(stats);
+            }
+
+            Err(_) => {
+                cancel.request();
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "recovery batch channel disconnected without Done",
+                ));
             }
         }
     }
@@ -285,6 +354,7 @@ fn flush_pending(
     freeze_timeout: Duration,
     counters: Option<&StatusCounters>,
     stats: &mut BatchStats,
+    cancel: &crate::cancel::CancelToken,
 ) -> io::Result<()> {
     let deferred = flush_batch(
         pending,
@@ -296,6 +366,7 @@ fn flush_pending(
         freeze_timeout,
         counters,
         stats,
+        cancel,
     )?;
     *pending = deferred;
     Ok(())
@@ -316,6 +387,7 @@ fn flush_batch(
     freeze_timeout: Duration,
     counters: Option<&StatusCounters>,
     stats: &mut BatchStats,
+    cancel: &crate::cancel::CancelToken,
 ) -> io::Result<Vec<Candidate>> {
     let mut batch = batch.to_vec();
     // Dedup: the scrub can report the same sector more than once.
@@ -356,7 +428,18 @@ fn flush_batch(
     let freeze_started = std::time::Instant::now();
     let mut deferred: Vec<Candidate> = Vec::new();
 
+    // Remember the first fatal write/verification error, but do not return
+    // until the filesystem has been thawed.
+    let mut fatal_write_error: Option<io::Error> = None;
+
     for (i, cand) in batch.iter().enumerate() {
+        if cancel.requested() {
+            fatal_write_error = Some(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "recovery cancelled during active batch",
+            ));
+            break;
+        }
         if i > 0 && writes_allowed && freeze_started.elapsed() > freeze_timeout {
             deferred.extend_from_slice(&batch[i..]);
             eprintln!(
@@ -504,8 +587,27 @@ fn flush_batch(
                     continue;
                 }
 
+                if cancel.requested() {
+                    fatal_write_error = Some(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "recovery cancelled before repair write",
+                    ));
+                    break;
+                }
+
                 // Write the recovered block straight to the raw rdev.
-                match stripe::write_block(cfg, &cand.failing_dev, cand.array_phys, block) {
+                #[cfg(test)]
+                let write_result = if TEST_FAULT.with(|fault| fault.get() == TestFault::Write) {
+                    Err(io::Error::other("injected write failure"))
+                } else {
+                    stripe::write_block(cfg, &cand.failing_dev, cand.array_phys, block)
+                };
+
+                #[cfg(not(test))]
+                let write_result =
+                    stripe::write_block(cfg, &cand.failing_dev, cand.array_phys, block);
+
+                match write_result {
                     Ok(()) => {
                         if let Some(c) = counters
                             && has_live_mount
@@ -519,20 +621,44 @@ fn flush_batch(
                         if let Some(c) = counters {
                             c.failed.fetch_add(1, Ordering::Relaxed);
                         }
-                        continue;
+                        fatal_write_error = Some(io::Error::other(format!(
+                            "write back failed at raw offset 0x{:x}: {e}",
+                            cand.raw_phys
+                        )));
+                        break;
                     }
                 }
 
                 // Drop the device page cache so the read-back reads the platter,
                 // not stale cache.
-                match drop_cache(&cand.failing_dev) {
+                #[cfg(test)]
+                let cache_result = if TEST_FAULT.with(|fault| fault.get() == TestFault::CacheFlush)
+                {
+                    Err(io::Error::other("injected cache invalidation failure"))
+                } else {
+                    drop_cache(&cand.failing_dev)
+                };
+
+                #[cfg(not(test))]
+                let cache_result = drop_cache(&cand.failing_dev);
+
+                match cache_result {
                     Ok(()) => {}
                     Err(e) => {
                         use std::os::unix::fs::FileTypeExt;
                         let is_block = std::fs::metadata(&cand.failing_dev)
                             .map(|m| m.file_type().is_block_device())
                             .unwrap_or(false);
-                        if is_block {
+                        if is_block || {
+                            #[cfg(test)]
+                            {
+                                TEST_FAULT.with(|fault| fault.get() == TestFault::CacheFlush)
+                            }
+                            #[cfg(not(test))]
+                            {
+                                false
+                            }
+                        } {
                             eprintln!(
                                 "  [0x{:x}] READ-BACK VERIFY NOT TRUSTED: could not \
                                  invalidate the raw rdev cache before read-back ({e}) — the \
@@ -545,8 +671,11 @@ fn flush_batch(
                                 c.readback_failed.fetch_add(1, Ordering::Relaxed);
                             }
 
-                            let _ = drop_cache(&cand.failing_dev);
-                            continue;
+                            fatal_write_error = Some(io::Error::other(format!(
+                                "cache invalidation failed after write at raw offset 0x{:x}: {e}",
+                                cand.raw_phys
+                            )));
+                            break;
                         }
                         eprintln!(
                             "  [0x{:x}] note: BLKFLSBUF unavailable on this image ({e}); \
@@ -558,6 +687,21 @@ fn flush_batch(
                 }
                 // Read-back verification: only count the write as recovered when
                 // the device returns bytes that verify.
+                #[cfg(test)]
+                let reread = match TEST_FAULT.with(|fault| fault.get()) {
+                    TestFault::Readback => Ok(vec![0u8; cand.block_size]),
+                    TestFault::ReadbackIo => {
+                        Err(io::Error::other("injected read-back I/O failure"))
+                    }
+                    _ => stripe::read_block_or_zeros(
+                        cfg,
+                        &cand.failing_dev,
+                        cand.array_phys,
+                        cand.block_size,
+                    ),
+                };
+
+                #[cfg(not(test))]
                 let reread = stripe::read_block_or_zeros(
                     cfg,
                     &cand.failing_dev,
@@ -587,6 +731,12 @@ fn flush_batch(
                         if let Some(c) = counters {
                             c.readback_failed.fetch_add(1, Ordering::Relaxed);
                         }
+
+                        fatal_write_error = Some(io::Error::other(format!(
+                            "read-back verification mismatch at raw offset 0x{:x}",
+                            cand.raw_phys
+                        )));
+                        break;
                     }
                     Err(e) => {
                         eprintln!(
@@ -598,6 +748,11 @@ fn flush_batch(
                         if let Some(c) = counters {
                             c.readback_failed.fetch_add(1, Ordering::Relaxed);
                         }
+                        fatal_write_error = Some(io::Error::other(format!(
+                            "read-back error at raw offset 0x{:x}: {e}",
+                            cand.raw_phys
+                        )));
+                        break;
                     }
                 }
 
@@ -632,7 +787,21 @@ fn flush_batch(
     // A failed thaw means the filesystem may still be frozen — abort the run
     // rather than risk unfrozen writes in later batches.
     drop(freeze_guard);
-    if let Some(e) = freeze.take_thaw_error() {
+
+    #[cfg(test)]
+    let thaw_error = if TEST_FAULT.with(|fault| fault.get() == TestFault::Thaw) {
+        Some(io::Error::other("injected thaw failure"))
+    } else {
+        freeze.take_thaw_error()
+    };
+
+    #[cfg(not(test))]
+    let thaw_error = freeze.take_thaw_error();
+
+    if let Some(e) = thaw_error {
+        if let Some(counters) = counters {
+            counters.record_thaw_failure();
+        }
         let mnt = freeze
             .mountpoint()
             .map(|p| p.display().to_string())
@@ -642,6 +811,9 @@ fn flush_batch(
              BE FROZEN. Thaw it manually with `fsfreeze -u {mnt}`, then re-run. Aborting \
              the run: no further batches will start while the filesystem may be frozen."
         )));
+    }
+    if let Some(e) = fatal_write_error {
+        return Err(e);
     }
     Ok(deferred)
 }
@@ -685,6 +857,17 @@ mod tests {
             } else {
                 Reconfirm::Corruption
             }
+        }
+    }
+
+    struct CancellingReconfirmer {
+        cancel: crate::cancel::CancelToken,
+    }
+
+    impl Reconfirmer for CancellingReconfirmer {
+        fn reconfirm(&mut self, _req: &ReconfirmRequest) -> Reconfirm {
+            self.cancel.request();
+            Reconfirm::Corruption
         }
     }
 
@@ -732,25 +915,40 @@ mod tests {
         cands: Vec<Candidate>,
         stub: VerdictStub,
     ) -> BatchStats {
+        run_batch_for_slot(cfg, freeze, 1, dry_run, cands, stub)
+    }
+
+    fn run_batch_for_slot(
+        cfg: &ArrayConfig,
+        freeze: FreezeController,
+        scrub_slot: u64,
+        dry_run: bool,
+        cands: Vec<Candidate>,
+        stub: VerdictStub,
+    ) -> BatchStats {
         let mut reconfirmer: Box<dyn Reconfirmer> = Box::new(stub);
         let mut stats = BatchStats::default();
         let mut freeze = freeze;
+
         let deferred = flush_batch(
             &cands,
             cfg,
             &mut freeze,
             &mut reconfirmer,
-            1,
+            scrub_slot,
             dry_run,
             Duration::from_secs(60),
             None,
             &mut stats,
+            &crate::cancel::CancelToken::new(),
         )
         .expect("batch must not abort");
+
         assert!(
             deferred.is_empty(),
             "no freeze-timeout deferral expected in this test"
         );
+
         stats
     }
 
@@ -920,6 +1118,243 @@ mod tests {
     }
 
     #[test]
+    fn write_failure_aborts_batch_without_writing_later_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, d1) = cfg(&dir);
+
+        let before = fs::read(&d1).unwrap();
+
+        let candidates = vec![
+            cand(d1.clone(), 0, 0, false),
+            cand(d1.clone(), 16, 1, false),
+        ];
+
+        let mut freeze = FreezeController::new(None);
+        let mut reconfirmer: Box<dyn Reconfirmer> = Box::new(VerdictStub {
+            stale_tokens: vec![],
+            unverifiable_tokens: vec![],
+        });
+        let mut stats = BatchStats::default();
+
+        let _fault = TestFaultGuard::new(TestFault::Write);
+
+        let result = flush_batch(
+            &candidates,
+            &cfg,
+            &mut freeze,
+            &mut reconfirmer,
+            1,
+            false,
+            Duration::from_secs(60),
+            None,
+            &mut stats,
+            &crate::cancel::CancelToken::new(),
+        );
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("injected write failure must abort the batch"),
+        };
+        assert!(
+            err.to_string().contains("injected write failure"),
+            "unexpected error: {err}"
+        );
+
+        assert_eq!(stats.mismatch, 1, "only first candidate was processed");
+        assert_eq!(stats.failed, 1, "failed write was counted");
+        assert_eq!(stats.recovered, 0);
+
+        assert_eq!(
+            fs::read(&d1).unwrap(),
+            before,
+            "no candidate should have been written"
+        );
+    }
+
+    #[test]
+    fn readback_mismatch_aborts_batch_without_writing_later_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, d1) = cfg(&dir);
+
+        let before = fs::read(&d1).unwrap();
+
+        let candidates = vec![
+            cand(d1.clone(), 0, 0, false),
+            cand(d1.clone(), 16, 1, false),
+        ];
+
+        let mut freeze = FreezeController::new(None);
+        let mut reconfirmer: Box<dyn Reconfirmer> = Box::new(VerdictStub {
+            stale_tokens: vec![],
+            unverifiable_tokens: vec![],
+        });
+        let mut stats = BatchStats::default();
+
+        let _fault = TestFaultGuard::new(TestFault::Readback);
+
+        let result = flush_batch(
+            &candidates,
+            &cfg,
+            &mut freeze,
+            &mut reconfirmer,
+            1,
+            false,
+            Duration::from_secs(60),
+            None,
+            &mut stats,
+            &crate::cancel::CancelToken::new(),
+        );
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("read-back mismatch must abort the batch"),
+        };
+
+        assert!(
+            err.to_string().contains("read-back verification mismatch"),
+            "unexpected error: {err}"
+        );
+
+        assert_eq!(stats.mismatch, 1, "only first candidate was processed");
+        assert_eq!(stats.readback_failed, 1);
+        assert_eq!(stats.recovered, 0);
+
+        let after = fs::read(&d1).unwrap();
+
+        assert_eq!(
+            &after[..16],
+            &vec![0x44u8; 16],
+            "first candidate was written before read-back verification failed"
+        );
+        assert_eq!(
+            &after[16..],
+            &before[16..],
+            "second candidate must remain untouched"
+        );
+    }
+
+    #[test]
+    fn readback_io_failure_aborts_batch_without_writing_later_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, d1) = cfg(&dir);
+
+        let before = fs::read(&d1).unwrap();
+
+        let candidates = vec![
+            cand(d1.clone(), 0, 0, false),
+            cand(d1.clone(), 16, 1, false),
+        ];
+
+        let mut freeze = FreezeController::new(None);
+        let mut reconfirmer: Box<dyn Reconfirmer> = Box::new(VerdictStub {
+            stale_tokens: vec![],
+            unverifiable_tokens: vec![],
+        });
+        let mut stats = BatchStats::default();
+
+        let _fault = TestFaultGuard::new(TestFault::ReadbackIo);
+
+        let result = flush_batch(
+            &candidates,
+            &cfg,
+            &mut freeze,
+            &mut reconfirmer,
+            1,
+            false,
+            Duration::from_secs(60),
+            None,
+            &mut stats,
+            &crate::cancel::CancelToken::new(),
+        );
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("read-back I/O failure must abort the batch"),
+        };
+
+        assert!(err.to_string().contains(""), "unexpected error: {err}");
+
+        assert_eq!(stats.mismatch, 1, "only first candidate was processed");
+        assert_eq!(stats.readback_failed, 1);
+        assert_eq!(stats.recovered, 0);
+
+        let after = fs::read(&d1).unwrap();
+
+        assert_eq!(
+            &after[..16],
+            &vec![0x44u8; 16],
+            "first candidate was written before read-back verification failed"
+        );
+        assert_eq!(
+            &after[16..],
+            &before[16..],
+            "second candidate must remain untouched"
+        );
+    }
+    #[test]
+    fn cache_failure_aborts_batch_without_writing_later_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, d1) = cfg(&dir);
+
+        let before = fs::read(&d1).unwrap();
+
+        let candidates = vec![
+            cand(d1.clone(), 0, 0, false),
+            cand(d1.clone(), 16, 1, false),
+        ];
+
+        let mut freeze = FreezeController::new(None);
+        let mut reconfirmer: Box<dyn Reconfirmer> = Box::new(VerdictStub {
+            stale_tokens: vec![],
+            unverifiable_tokens: vec![],
+        });
+        let mut stats = BatchStats::default();
+
+        let _fault = TestFaultGuard::new(TestFault::CacheFlush);
+
+        let result = flush_batch(
+            &candidates,
+            &cfg,
+            &mut freeze,
+            &mut reconfirmer,
+            1,
+            false,
+            Duration::from_secs(60),
+            None,
+            &mut stats,
+            &crate::cancel::CancelToken::new(),
+        );
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("injected cache failure must abort the batch"),
+        };
+
+        assert!(
+            err.to_string()
+                .contains("injected cache invalidation failure"),
+            "unexpected error: {err}"
+        );
+
+        assert_eq!(stats.mismatch, 1, "only first candidate was processed");
+        assert_eq!(stats.readback_failed, 1);
+        assert_eq!(stats.recovered, 0);
+
+        let after = fs::read(&d1).unwrap();
+
+        assert_eq!(
+            &after[..16],
+            &vec![0x44u8; 16],
+            "first candidate was written before cache invalidation failed"
+        );
+        assert_eq!(
+            &after[16..],
+            &before[16..],
+            "later candidates must remain untouched"
+        );
+    }
+
+    #[test]
     fn fresh_read_failure_degrades_to_unreadable_recovery_path() {
         let dir = tempfile::tempdir().unwrap();
         let (cfg, d1) = cfg(&dir);
@@ -971,6 +1406,7 @@ mod tests {
             Duration::from_millis(0),
             None,
             &mut stats,
+            &crate::cancel::CancelToken::new(),
         )
         .expect("deferral is not an abort");
         assert_eq!(deferred.len(), 2, "candidates 2 and 3 deferred");
@@ -998,6 +1434,7 @@ mod tests {
             Duration::from_millis(0),
             None,
             &mut stats2,
+            &crate::cancel::CancelToken::new(),
         )
         .expect("second flush must not abort");
         assert_eq!(deferred2.len(), 1);
@@ -1012,11 +1449,925 @@ mod tests {
             Duration::from_millis(0),
             None,
             &mut stats2,
+            &crate::cancel::CancelToken::new(),
         )
         .expect("third flush must not abort");
         assert!(deferred3.is_empty());
         assert_eq!(stats2.recovered, 2);
 
         assert_eq!(stats.recovered + stats2.recovered, 3);
+    }
+
+    #[test]
+    fn integration_4k_p_recovery_repairs_corrupted_sector() {
+        const SIZE: usize = 4096;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // Three data disks containing distinct deterministic data.
+        let original: Vec<Vec<u8>> = (1..=3u8)
+            .map(|disk| {
+                (0..SIZE)
+                    .map(|i| (i as u8).wrapping_mul(17).wrapping_add(disk))
+                    .collect()
+            })
+            .collect();
+
+        let mut paths = Vec::new();
+        for (i, data) in original.iter().enumerate() {
+            let path = dir.path().join(format!("disk{}", i + 1));
+            fs::write(&path, data).unwrap();
+            paths.push(path);
+        }
+
+        // Compute correct P parity from the original data.
+        let mut parity = vec![0u8; SIZE];
+        for data in &original {
+            for (p, d) in parity.iter_mut().zip(data) {
+                *p ^= *d;
+            }
+        }
+
+        let parity_path = dir.path().join("parity_p");
+        fs::write(&parity_path, parity).unwrap();
+
+        let cfg = ArrayConfig {
+            data_devs: BTreeMap::from([
+                (1, paths[0].clone()),
+                (2, paths[1].clone()),
+                (3, paths[2].clone()),
+            ]),
+            parity_p: Some(parity_path),
+            parity_q: None,
+            rdev_offsets: BTreeMap::new(),
+        };
+
+        // Corrupt disk 2 directly, leaving parity unchanged.
+        let mut damaged = original[0].clone();
+        damaged[1234] ^= 0x5a;
+        fs::write(&paths[0], &damaged).unwrap();
+
+        assert_ne!(fs::read(&paths[0]).unwrap(), original[1]);
+
+        // Verify against the original bytes.
+        let golden = original[0].clone();
+        let verify: SectorVerifier = Arc::new(move |block: &[u8]| block == golden.as_slice());
+
+        let candidate = Candidate {
+            array_phys: 0,
+            block_size: SIZE,
+            verify,
+            raw_phys: 0,
+            failing_dev: paths[0].clone(),
+            reconfirm: None,
+            unreadable: false,
+        };
+
+        let stats = run_batch(
+            &cfg,
+            FreezeController::new(None),
+            false,
+            vec![candidate],
+            VerdictStub {
+                stale_tokens: vec![],
+                unverifiable_tokens: vec![],
+            },
+        );
+
+        assert_eq!(stats.recovered, 1);
+        assert_eq!(stats.failed, 0);
+        assert_eq!(stats.readback_failed, 0);
+
+        // Most important assertion: the repaired bytes are exactly correct.
+        assert_eq!(fs::read(&paths[0]).unwrap(), original[0]);
+
+        // Other data disks must remain untouched.
+        assert_eq!(fs::read(&paths[1]).unwrap(), original[1]);
+        assert_eq!(fs::read(&paths[2]).unwrap(), original[2]);
+    }
+
+    #[test]
+    fn integration_4k_q_recovery_when_p_baked_in() {
+        const SIZE: usize = 4096;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create three simulated data disks with deterministic contents.
+        let original: Vec<Vec<u8>> = (1..=3u8)
+            .map(|disk| {
+                (0..SIZE)
+                    .map(|i| (i as u8).wrapping_mul(17).wrapping_add(disk))
+                    .collect()
+            })
+            .collect();
+
+        let mut paths = Vec::new();
+
+        for (i, data) in original.iter().enumerate() {
+            let path = dir.path().join(format!("disk{}", i + 1));
+            fs::write(&path, data).unwrap();
+            paths.push(path);
+        }
+
+        let parity_p_path = dir.path().join("parity_p");
+        let parity_q_path = dir.path().join("parity_q");
+
+        let cfg = ArrayConfig {
+            data_devs: BTreeMap::from([
+                (1, paths[0].clone()),
+                (2, paths[1].clone()),
+                (3, paths[2].clone()),
+            ]),
+            parity_p: Some(parity_p_path.clone()),
+            parity_q: Some(parity_q_path.clone()),
+            rdev_offsets: BTreeMap::new(),
+        };
+
+        // Generate Q from the original, uncorrupted data.
+        let q_original = crate::array::parity::compute_q(&cfg, 0, SIZE)
+            .expect("Q parity calculation must succeed");
+
+        fs::write(&parity_q_path, &q_original).unwrap();
+
+        // Corrupt data disk 2.
+        let mut damaged = original[1].clone();
+        damaged[1234] ^= 0x5a;
+
+        fs::write(&paths[1], &damaged).unwrap();
+
+        // Recompute P from the now-corrupted data.
+        // This simulates corruption that has been incorporated into P parity.
+        let mut p_baked = vec![0u8; SIZE];
+
+        for path in &paths {
+            let data = fs::read(path).unwrap();
+
+            for (p, d) in p_baked.iter_mut().zip(data.iter()) {
+                *p ^= *d;
+            }
+        }
+
+        fs::write(&parity_p_path, &p_baked).unwrap();
+
+        // P reconstruction will produce the corrupted bytes.
+        // Q reconstruction should produce the original bytes.
+        let golden = original[1].clone();
+
+        let verify: SectorVerifier = Arc::new(move |block: &[u8]| block == golden.as_slice());
+
+        let candidate = Candidate {
+            array_phys: 0,
+            block_size: SIZE,
+            verify,
+            raw_phys: 0,
+            failing_dev: paths[1].clone(),
+            reconfirm: None,
+            unreadable: false,
+        };
+
+        let stats = run_batch_for_slot(
+            &cfg,
+            FreezeController::new(None),
+            2,
+            false,
+            vec![candidate],
+            VerdictStub {
+                stale_tokens: vec![],
+                unverifiable_tokens: vec![],
+            },
+        );
+
+        assert_eq!(stats.recovered, 1);
+        assert_eq!(stats.failed, 0);
+        assert_eq!(stats.readback_failed, 0);
+
+        // The damaged disk must be restored byte-for-byte.
+        assert_eq!(fs::read(&paths[1]).unwrap(), original[1]);
+
+        // All other disks and both parity files must remain unchanged.
+        assert_eq!(fs::read(&paths[0]).unwrap(), original[0]);
+        assert_eq!(fs::read(&paths[2]).unwrap(), original[2]);
+        assert_eq!(fs::read(&parity_p_path).unwrap(), p_baked);
+        assert_eq!(fs::read(&parity_q_path).unwrap(), q_original);
+    }
+
+    #[test]
+    fn integration_4k_unrecoverable_corruption_never_writes() {
+        const SIZE: usize = 4096;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create three simulated data disks with deterministic contents.
+        let original: Vec<Vec<u8>> = (1..=3u8)
+            .map(|disk| {
+                (0..SIZE)
+                    .map(|i| (i as u8).wrapping_mul(17).wrapping_add(disk))
+                    .collect()
+            })
+            .collect();
+
+        let mut paths = Vec::new();
+
+        for (i, data) in original.iter().enumerate() {
+            let path = dir.path().join(format!("disk{}", i + 1));
+            fs::write(&path, data).unwrap();
+            paths.push(path);
+        }
+
+        let parity_p_path = dir.path().join("parity_p");
+        let parity_q_path = dir.path().join("parity_q");
+
+        let cfg = ArrayConfig {
+            data_devs: BTreeMap::from([
+                (1, paths[0].clone()),
+                (2, paths[1].clone()),
+                (3, paths[2].clone()),
+            ]),
+            parity_p: Some(parity_p_path.clone()),
+            parity_q: Some(parity_q_path.clone()),
+            rdev_offsets: BTreeMap::new(),
+        };
+
+        // Generate Q from the original, uncorrupted data.
+        let q_original = crate::array::parity::compute_q(&cfg, 0, SIZE)
+            .expect("Q parity calculation must succeed");
+
+        fs::write(&parity_q_path, &q_original).unwrap();
+
+        // Corrupt data disk 2.
+        let mut damaged = original[1].clone();
+        damaged[1234] ^= 0x5a;
+
+        fs::write(&paths[1], &damaged).unwrap();
+
+        // Recompute P from the now-corrupted data.
+        // This simulates corruption that has been incorporated into P parity.
+        let mut p_baked = vec![0u8; SIZE];
+
+        for path in &paths {
+            let data = fs::read(path).unwrap();
+
+            for (p, d) in p_baked.iter_mut().zip(data.iter()) {
+                *p ^= *d;
+            }
+        }
+
+        fs::write(&parity_p_path, &p_baked).unwrap();
+
+        // Both parity disks now reflect the corrupted data.
+        let q_baked = crate::array::parity::compute_q(&cfg, 0, SIZE)
+            .expect("Q parity calculation must succeed");
+
+        fs::write(&parity_q_path, &q_baked).unwrap();
+
+        // P reconstruction will produce the corrupted bytes.
+        // Q reconstruction should produce the original bytes.
+        let golden = original[1].clone();
+
+        let verify: SectorVerifier = Arc::new(move |block: &[u8]| block == golden.as_slice());
+
+        let candidate = Candidate {
+            array_phys: 0,
+            block_size: SIZE,
+            verify,
+            raw_phys: 0,
+            failing_dev: paths[1].clone(),
+            reconfirm: None,
+            unreadable: false,
+        };
+
+        let stats = run_batch_for_slot(
+            &cfg,
+            FreezeController::new(None),
+            2,
+            false,
+            vec![candidate],
+            VerdictStub {
+                stale_tokens: vec![],
+                unverifiable_tokens: vec![],
+            },
+        );
+
+        assert_eq!(stats.recovered, 0);
+        assert_eq!(stats.failed, 1);
+        assert_eq!(stats.readback_failed, 0);
+
+        // Recovery failed, so the corrupted bytes must remain untouched.
+        assert_eq!(fs::read(&paths[1]).unwrap(), damaged);
+
+        // Other data disks must remain unchanged.
+        assert_eq!(fs::read(&paths[0]).unwrap(), original[0]);
+        assert_eq!(fs::read(&paths[2]).unwrap(), original[2]);
+
+        // Neither parity disk may be modified.
+        assert_eq!(fs::read(&parity_p_path).unwrap(), p_baked);
+        assert_eq!(fs::read(&parity_q_path).unwrap(), q_baked);
+    }
+
+    #[test]
+    fn integration_4k_dry_run_recovers_without_writing() {
+        const SIZE: usize = 4096;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // Three data disks containing distinct deterministic data.
+        let original: Vec<Vec<u8>> = (1..=3u8)
+            .map(|disk| {
+                (0..SIZE)
+                    .map(|i| (i as u8).wrapping_mul(17).wrapping_add(disk))
+                    .collect()
+            })
+            .collect();
+
+        let mut paths = Vec::new();
+        for (i, data) in original.iter().enumerate() {
+            let path = dir.path().join(format!("disk{}", i + 1));
+            fs::write(&path, data).unwrap();
+            paths.push(path);
+        }
+
+        // Compute correct P parity from the original data.
+        let mut parity = vec![0u8; SIZE];
+        for data in &original {
+            for (p, d) in parity.iter_mut().zip(data) {
+                *p ^= *d;
+            }
+        }
+
+        let parity_path = dir.path().join("parity_p");
+        fs::write(&parity_path, &parity).unwrap();
+
+        let cfg = ArrayConfig {
+            data_devs: BTreeMap::from([
+                (1, paths[0].clone()),
+                (2, paths[1].clone()),
+                (3, paths[2].clone()),
+            ]),
+            parity_p: Some(parity_path.clone()),
+            parity_q: None,
+            rdev_offsets: BTreeMap::new(),
+        };
+
+        // Corrupt disk 2 directly, leaving parity unchanged.
+        let mut damaged = original[0].clone();
+        damaged[1234] ^= 0x5a;
+        fs::write(&paths[0], &damaged).unwrap();
+
+        assert_ne!(fs::read(&paths[0]).unwrap(), original[1]);
+
+        // Verify against the original bytes.
+        let golden = original[0].clone();
+        let verify: SectorVerifier = Arc::new(move |block: &[u8]| block == golden.as_slice());
+
+        let candidate = Candidate {
+            array_phys: 0,
+            block_size: SIZE,
+            verify,
+            raw_phys: 0,
+            failing_dev: paths[0].clone(),
+            reconfirm: None,
+            unreadable: false,
+        };
+
+        let stats = run_batch(
+            &cfg,
+            FreezeController::new(None),
+            true,
+            vec![candidate],
+            VerdictStub {
+                stale_tokens: vec![],
+                unverifiable_tokens: vec![],
+            },
+        );
+
+        assert_eq!(stats.recovered, 1);
+        assert_eq!(stats.failed, 0);
+        assert_eq!(stats.readback_failed, 0);
+
+        // Most important assertion: the repaired bytes are exactly correct.
+        assert_eq!(fs::read(&paths[0]).unwrap(), damaged);
+
+        // Other data disks must remain untouched.
+        assert_eq!(fs::read(&paths[1]).unwrap(), original[1]);
+        assert_eq!(fs::read(&paths[2]).unwrap(), original[2]);
+
+        assert_eq!(fs::read(&parity_path).unwrap(), parity);
+    }
+
+    #[test]
+    fn integration_4k_two_disk_corruption_recovers_via_pq() {
+        const SIZE: usize = 4096;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create three simulated data disks with deterministic contents.
+        let original: Vec<Vec<u8>> = (1..=3u8)
+            .map(|disk| {
+                (0..SIZE)
+                    .map(|i| (i as u8).wrapping_mul(17).wrapping_add(disk))
+                    .collect()
+            })
+            .collect();
+
+        let mut paths = Vec::new();
+
+        for (i, data) in original.iter().enumerate() {
+            let path = dir.path().join(format!("disk{}", i + 1));
+            fs::write(&path, data).unwrap();
+            paths.push(path);
+        }
+
+        let parity_p_path = dir.path().join("parity_p");
+        let parity_q_path = dir.path().join("parity_q");
+
+        let cfg = ArrayConfig {
+            data_devs: BTreeMap::from([
+                (1, paths[0].clone()),
+                (2, paths[1].clone()),
+                (3, paths[2].clone()),
+            ]),
+            parity_p: Some(parity_p_path.clone()),
+            parity_q: Some(parity_q_path.clone()),
+            rdev_offsets: BTreeMap::new(),
+        };
+
+        // Generate Q from the original, uncorrupted data.
+        let q_original = crate::array::parity::compute_q(&cfg, 0, SIZE)
+            .expect("Q parity calculation must succeed");
+
+        fs::write(&parity_q_path, &q_original).unwrap();
+
+        // Generate correct P parity BEFORE corrupting either data disk.
+        let mut p_original = vec![0u8; SIZE];
+
+        for data in &original {
+            for (p, d) in p_original.iter_mut().zip(data.iter()) {
+                *p ^= *d;
+            }
+        }
+
+        fs::write(&parity_p_path, &p_original).unwrap();
+
+        // Corrupt the same byte position on two different data disks.
+        let mut damaged_1 = original[0].clone();
+        damaged_1[1234] ^= 0x5a;
+        fs::write(&paths[0], &damaged_1).unwrap();
+
+        let mut damaged_2 = original[1].clone();
+        damaged_2[1234] ^= 0xa7;
+        fs::write(&paths[1], &damaged_2).unwrap();
+
+        // P reconstruction will produce the corrupted bytes.
+        // Q reconstruction should produce the original bytes.
+        let golden = original[1].clone();
+
+        let verify: SectorVerifier = Arc::new(move |block: &[u8]| block == golden.as_slice());
+
+        let candidate = Candidate {
+            array_phys: 0,
+            block_size: SIZE,
+            verify,
+            raw_phys: 0,
+            failing_dev: paths[1].clone(),
+            reconfirm: None,
+            unreadable: false,
+        };
+
+        let stats = run_batch_for_slot(
+            &cfg,
+            FreezeController::new(None),
+            2,
+            false,
+            vec![candidate],
+            VerdictStub {
+                stale_tokens: vec![],
+                unverifiable_tokens: vec![],
+            },
+        );
+
+        assert_eq!(stats.recovered, 1);
+        assert_eq!(stats.failed, 0);
+        assert_eq!(stats.readback_failed, 0);
+
+        // Disk 2 must be repaired to its original contents.
+        assert_eq!(fs::read(&paths[1]).unwrap(), original[1]);
+
+        // Disk 1 must still contain its corruption.
+        // Recovery of disk 2 must not silently modify disk 1.
+        assert_eq!(fs::read(&paths[0]).unwrap(), damaged_1);
+
+        // Disk 3 must remain untouched.
+        assert_eq!(fs::read(&paths[2]).unwrap(), original[2]);
+
+        // Both parity disks must remain unchanged.
+        assert_eq!(fs::read(&parity_p_path).unwrap(), p_original);
+        assert_eq!(fs::read(&parity_q_path).unwrap(), q_original);
+    }
+
+    #[test]
+    #[ignore = "requires mounted disposable Btrfs fixture and root"]
+    fn write_failure_thaws_live_filesystem() {
+        use std::io::Write;
+
+        let testdir = fs::read_to_string("/tmp/scrub-rs-parity-testdir")
+            .expect("missing parity fixture pointer");
+        let mountpoint = PathBuf::from(testdir.trim()).join("mnt");
+
+        assert!(mountpoint.is_dir(), "fixture mountpoint does not exist");
+
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, d1) = cfg(&dir);
+        let before = fs::read(&d1).unwrap();
+
+        let candidates = vec![cand(d1.clone(), 0, 0, false)];
+
+        let mut freeze = FreezeController::new(Some(mountpoint.clone()));
+        let mut reconfirmer: Box<dyn Reconfirmer> = Box::new(VerdictStub {
+            stale_tokens: vec![],
+            unverifiable_tokens: vec![],
+        });
+        let mut stats = BatchStats::default();
+
+        let _fault = TestFaultGuard::new(TestFault::Write);
+
+        let result = flush_batch(
+            &candidates,
+            &cfg,
+            &mut freeze,
+            &mut reconfirmer,
+            1,
+            false,
+            Duration::from_secs(60),
+            None,
+            &mut stats,
+            &crate::cancel::CancelToken::new(),
+        );
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("injected write failure must abort the batch"),
+        };
+
+        assert!(
+            err.to_string().contains("injected write failure"),
+            "unexpected error: {err}"
+        );
+
+        assert!(
+            freeze.take_thaw_error().is_none(),
+            "filesystem thaw reported an error"
+        );
+
+        assert_eq!(stats.failed, 1);
+        assert_eq!(stats.recovered, 0);
+        assert_eq!(fs::read(&d1).unwrap(), before);
+
+        // Verify the mounted filesystem is actually writable after the error.
+        let probe = mountpoint.join(".recovery-failure-thaw-probe");
+
+        let mut file =
+            fs::File::create(&probe).expect("filesystem remained frozen after recovery failure");
+
+        file.write_all(b"recovery failure thaw verified\n")
+            .expect("write failed after recovery failure");
+
+        file.sync_all().expect("sync failed after recovery failure");
+
+        drop(file);
+        fs::remove_file(&probe).expect("probe cleanup failed");
+    }
+
+    #[test]
+    fn writer_failures_cancel_without_another_candidate() {
+        for fault in [TestFault::Write, TestFault::Readback, TestFault::Thaw] {
+            let dir = tempfile::tempdir().unwrap();
+            let (cfg, d1) = cfg(&dir);
+            let (tx, rx) = mpsc::channel();
+            tx.send(BatchMsg::Batch(vec![cand(d1, 0, 0, false)]))
+                .unwrap();
+            // Keep the sender alive without sending Done or another candidate.
+            let cancel = crate::cancel::CancelToken::new();
+            let counters = StatusCounters::new();
+            let _fault = TestFaultGuard::new(fault);
+            let err = run_writer(
+                rx,
+                cfg,
+                FreezeController::new(None),
+                Box::new(VerdictStub {
+                    stale_tokens: vec![],
+                    unverifiable_tokens: vec![],
+                }),
+                1,
+                false,
+                Duration::from_secs(60),
+                Some(&counters),
+                cancel.clone(),
+            )
+            .expect_err("injected failure must abort");
+            assert!(cancel.requested());
+            assert_ne!(err.kind(), io::ErrorKind::Interrupted);
+            assert_eq!(
+                counters.thaw_failed.load(Ordering::Relaxed),
+                u64::from(fault == TestFault::Thaw)
+            );
+            drop(tx);
+        }
+    }
+
+    #[test]
+    fn writer_disconnect_requests_cancellation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, _) = cfg(&dir);
+        let (tx, rx) = mpsc::channel();
+        drop(tx);
+        let cancel = crate::cancel::CancelToken::new();
+        let err = run_writer(
+            rx,
+            cfg,
+            FreezeController::new(None),
+            Box::new(VerdictStub {
+                stale_tokens: vec![],
+                unverifiable_tokens: vec![],
+            }),
+            1,
+            false,
+            Duration::from_secs(60),
+            None,
+            cancel.clone(),
+        )
+        .expect_err("disconnect without Done must fail");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(cancel.requested());
+    }
+
+    #[test]
+    fn thaw_failure_aborts_writer_before_next_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, d1) = cfg(&dir);
+        let before = fs::read(&d1).unwrap();
+
+        let (tx, rx) = mpsc::channel();
+
+        tx.send(BatchMsg::Batch(vec![cand(d1.clone(), 0, 0, false)]))
+            .unwrap();
+        tx.send(BatchMsg::Batch(vec![cand(d1.clone(), 16, 1, false)]))
+            .unwrap();
+        tx.send(BatchMsg::Done).unwrap();
+        drop(tx);
+
+        let reconfirmer: Box<dyn Reconfirmer> = Box::new(VerdictStub {
+            stale_tokens: vec![],
+            unverifiable_tokens: vec![],
+        });
+
+        let _fault = TestFaultGuard::new(TestFault::Thaw);
+
+        let result = run_writer(
+            rx,
+            cfg,
+            FreezeController::new(None),
+            reconfirmer,
+            1,
+            false,
+            Duration::from_secs(60),
+            None,
+            crate::cancel::CancelToken::new(),
+        );
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("injected thaw failure must abort the writer"),
+        };
+
+        assert!(
+            err.to_string().contains("injected thaw failure"),
+            "unexpected error: {err}"
+        );
+
+        let after = fs::read(&d1).unwrap();
+
+        assert_eq!(
+            &after[..16],
+            &vec![0x44u8; 16],
+            "first batch should complete before the simulated thaw error"
+        );
+
+        assert_eq!(
+            &after[16..],
+            &before[16..],
+            "second batch must not be processed"
+        );
+    }
+
+    #[test]
+    fn accumulator_discards_partial_batch_on_disconnect() {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let (batch_tx, batch_rx) = mpsc::sync_channel(1);
+
+        tx.send(Msg::Candidate(cand(
+            PathBuf::from("/tmp/test-device"),
+            0,
+            0,
+            false,
+        )))
+        .unwrap();
+        drop(tx);
+
+        run_accumulator(rx, batch_tx, 8, Duration::from_millis(10));
+
+        assert!(
+            batch_rx.try_recv().is_err(),
+            "disconnected scrub must not forward pending candidates"
+        );
+    }
+
+    #[test]
+    fn accumulator_flushes_partial_batch_on_done() {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let (batch_tx, batch_rx) = mpsc::sync_channel(1);
+
+        let handle = std::thread::spawn(move || {
+            run_accumulator(rx, batch_tx, 8, Duration::from_millis(10));
+        });
+
+        tx.send(Msg::Candidate(cand(
+            PathBuf::from("/tmp/test-device"),
+            0,
+            0,
+            false,
+        )))
+        .unwrap();
+
+        tx.send(Msg::Done).unwrap();
+        drop(tx);
+
+        match batch_rx.recv().unwrap() {
+            BatchMsg::Batch(batch) => assert_eq!(batch.len(), 1),
+            BatchMsg::Done => panic!("expected final candidate batch before Done"),
+        }
+
+        assert!(matches!(batch_rx.recv(), Ok(BatchMsg::Done)));
+
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn cancelled_batch_does_not_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, d1) = cfg(&dir);
+        let before = fs::read(&d1).unwrap();
+
+        let cancel = crate::cancel::CancelToken::new();
+        cancel.request();
+
+        let mut freeze = FreezeController::new(None);
+        let mut reconfirmer: Box<dyn Reconfirmer> = Box::new(VerdictStub {
+            stale_tokens: vec![],
+            unverifiable_tokens: vec![],
+        });
+        let mut stats = BatchStats::default();
+
+        let result = flush_batch(
+            &[cand(d1.clone(), 0, 0, false)],
+            &cfg,
+            &mut freeze,
+            &mut reconfirmer,
+            1,
+            false,
+            Duration::from_secs(60),
+            None,
+            &mut stats,
+            &cancel,
+        );
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("cancelled batch must not succeed"),
+        };
+        assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(fs::read(&d1).unwrap(), before);
+        assert_eq!(stats.recovered, 0);
+    }
+    #[test]
+    fn cancellation_during_recovery_prevents_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, d1) = cfg(&dir);
+        let before = fs::read(&d1).unwrap();
+
+        let cancel = crate::cancel::CancelToken::new();
+
+        let mut freeze = FreezeController::new(None);
+        let mut reconfirmer: Box<dyn Reconfirmer> = Box::new(CancellingReconfirmer {
+            cancel: cancel.clone(),
+        });
+        let mut stats = BatchStats::default();
+
+        let result = flush_batch(
+            &[cand(d1.clone(), 0, 0, false)],
+            &cfg,
+            &mut freeze,
+            &mut reconfirmer,
+            1,
+            false,
+            Duration::from_secs(60),
+            None,
+            &mut stats,
+            &cancel,
+        );
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("cancellation during recovery must abort the batch"),
+        };
+
+        assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+        assert!(cancel.requested());
+
+        assert_eq!(
+            fs::read(&d1).unwrap(),
+            before,
+            "cancellation must prevent the recovered block from being written"
+        );
+
+        assert_eq!(stats.mismatch, 1, "candidate processing should have begun");
+        assert_eq!(stats.recovered, 0, "no repair should be reported");
+    }
+    #[test]
+    #[ignore = "requires root and the mounted disposable Btrfs parity fixture"]
+    fn cancellation_thaws_live_filesystem() {
+        use std::io::Write;
+
+        let testdir = fs::read_to_string("/tmp/scrub-rs-parity-testdir")
+            .expect("missing parity fixture pointer");
+        let mountpoint = PathBuf::from(testdir.trim()).join("mnt");
+
+        assert!(mountpoint.is_dir(), "fixture mountpoint does not exist");
+
+        // Never accidentally test against an ordinary directory.
+        let output = std::process::Command::new("findmnt")
+            .args(["-rn", "-M"])
+            .arg(&mountpoint)
+            .output()
+            .expect("failed to execute findmnt");
+
+        assert!(
+            output.status.success() && !output.stdout.is_empty(),
+            "fixture mountpoint is not mounted"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, d1) = cfg(&dir);
+        let before = fs::read(&d1).unwrap();
+
+        let cancel = crate::cancel::CancelToken::new();
+
+        let mut freeze = FreezeController::new(Some(mountpoint.clone()));
+        let mut reconfirmer: Box<dyn Reconfirmer> = Box::new(CancellingReconfirmer {
+            cancel: cancel.clone(),
+        });
+        let mut stats = BatchStats::default();
+
+        let result = flush_batch(
+            &[cand(d1.clone(), 0, 0, false)],
+            &cfg,
+            &mut freeze,
+            &mut reconfirmer,
+            1,
+            false,
+            Duration::from_secs(60),
+            None,
+            &mut stats,
+            &cancel,
+        );
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("cancellation must abort recovery"),
+        };
+
+        assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+        assert!(cancel.requested());
+
+        assert!(
+            freeze.take_thaw_error().is_none(),
+            "filesystem thaw reported an error"
+        );
+
+        assert_eq!(stats.recovered, 0);
+        assert_eq!(fs::read(&d1).unwrap(), before);
+
+        // A successful write and sync confirm the filesystem is no longer frozen.
+        let probe = mountpoint.join(".recovery-cancellation-thaw-probe");
+
+        let mut file =
+            fs::File::create(&probe).expect("filesystem remained frozen after cancellation");
+
+        file.write_all(b"recovery cancellation thaw verified\n")
+            .expect("write failed after cancellation");
+
+        file.sync_all().expect("sync failed after cancellation");
+
+        drop(file);
+        fs::remove_file(&probe).expect("probe cleanup failed");
     }
 }

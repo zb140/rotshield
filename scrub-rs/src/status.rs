@@ -51,6 +51,10 @@ pub struct StatusCounters {
     /// Recovered blocks whose read-back verification failed.
     pub readback_failed: AtomicU64,
 
+    /// Sticky: a thaw attempt failed; manual verification is required even
+    /// if subsequent cleanup retries succeed. Not proof it is still frozen.
+    pub thaw_failed: AtomicU64,
+
     /// Candidates already matching their checksum by write time.
     pub not_corrupt: AtomicU64,
 
@@ -89,6 +93,10 @@ impl StatusCounters {
         self.recovery.store(u64::from(on), Ordering::Relaxed);
     }
 
+    pub fn record_thaw_failure(&self) {
+        self.thaw_failed.store(1, Ordering::Relaxed);
+    }
+
     /// Render all counters as key=value text for the status page.
     pub fn snapshot(&self) -> String {
         let l = |a: &AtomicU64| a.load(Ordering::Relaxed);
@@ -112,6 +120,7 @@ impl StatusCounters {
              metadata_mirror_mismatches={}\nmetadata_read_errors={}\n\
              recovered={}\nfailed={}\nskipped={}\n\
              not_frozen={}\nreadback_failed={}\nnot_corrupt={}\ndeduped={}\n\
+             thaw_failed={}\n\
              repaired_while_mounted={}\n\
              recovery={}\n\
              progress_total={}\nprogress_done={}\nprogress_pct={:.2}\n",
@@ -136,6 +145,7 @@ impl StatusCounters {
             l(&self.readback_failed),
             l(&self.not_corrupt),
             l(&self.deduped),
+            l(&self.thaw_failed),
             l(&self.repaired_while_mounted),
             l(&self.recovery),
             total,
@@ -241,6 +251,28 @@ impl StatusServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thaw_failure_is_sticky_and_independent_of_other_failures() {
+        let counters = StatusCounters::new();
+        counters.failed.store(2, Ordering::Relaxed);
+        counters.readback_failed.store(1, Ordering::Relaxed);
+        assert!(
+            counters
+                .snapshot()
+                .lines()
+                .any(|line| line == "thaw_failed=0")
+        );
+        counters.record_thaw_failure();
+        counters.record_thaw_failure();
+        counters.set_state("done");
+        assert!(
+            counters
+                .snapshot()
+                .lines()
+                .any(|line| line == "thaw_failed=1")
+        );
+    }
 
     /// Unique per-test socket path under the temp dir (parallel-safe).
     fn test_sock_path() -> std::path::PathBuf {

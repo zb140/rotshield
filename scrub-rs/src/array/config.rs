@@ -77,9 +77,22 @@ pub fn slot_from_array_partition(dev: &str) -> Option<u64> {
     digits.parse().ok()
 }
 
-/// First existing stat file, or None.
-fn stat_path() -> Option<&'static str> {
-    STAT_PATHS.iter().copied().find(|p| Path::new(p).exists())
+/// Locate the array-status file.
+///
+/// Test-enabled builds can use a synthetic nmdstat file.
+/// Production builds always use the normal /proc paths.
+fn stat_path() -> Option<String> {
+    #[cfg(feature = "test-array")]
+    {
+        if let Some(path) = std::env::var_os("SCRUB_RS_TEST_ARRAY_STAT") {
+            return Some(PathBuf::from(path).to_string_lossy().into_owned());
+        }
+    }
+
+    STAT_PATHS
+        .iter()
+        .find(|p| Path::new(p).exists())
+        .map(|p| (*p).to_string())
 }
 
 /// Parse one stat file (flat key=value) into an ArrayConfig.
@@ -143,7 +156,7 @@ pub fn load() -> std::io::Result<ArrayConfig> {
             "neither /proc/nmdstat nor /proc/mdstat found",
         ));
     };
-    let config = parse_nmdstat(path)?;
+    let config = parse_nmdstat(&path)?;
     if config.parity_p.is_none() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,

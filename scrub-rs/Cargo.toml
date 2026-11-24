@@ -28,3 +28,6 @@ path = "src/bin/craft_corrupt.rs"
 
 [profile.release]
 opt-level = 3
+
+[features]
+test-array = []

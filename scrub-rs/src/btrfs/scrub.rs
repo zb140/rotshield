@@ -171,6 +171,7 @@ pub fn scrub_dev_tree<F>(
     batch: bool,
     counters: Option<&StatusCounters>,
     mut on_sector: F,
+    cancel: Option<&crate::cancel::CancelToken>,
 ) -> io::Result<ScrubStats>
 where
     F: FnMut(&SectorResult),
@@ -193,7 +194,7 @@ where
                  falling back to inline (non-pipelined) reads"
             );
 
-            return Ok(scrub_dev_tree_inline(
+            let result = scrub_dev_tree_inline(
                 reader,
                 chunk_map,
                 csum_provider,
@@ -202,7 +203,15 @@ where
                 batch,
                 counters,
                 on_sector,
-            ));
+                cancel,
+            );
+            if cancel.is_some_and(|c| c.requested()) || crate::cancel::signal_requested() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "scrub cancelled",
+                ));
+            }
+            return Ok(result);
         }
     };
     let (cmd_tx, cmd_rx) = mpsc::sync_channel::<ReadCmd>(prefetch_depth);
@@ -246,6 +255,10 @@ where
     // Per dev-extent: gather its checksums into contiguous runs and feed
     // them to the pipeline.
     for (dev_extent_idx, dext) in dev_extents.iter().enumerate() {
+        if crate::cancel::signal_requested() || cancel.is_some_and(|c| c.requested()) {
+            pipeline_failed.set(true);
+            break;
+        }
         let chunk = match chunk_map.info(dext.chunk_offset) {
             Some(c) => c,
             // No chunk mapping for this dev extent — cannot map it to
@@ -335,7 +348,10 @@ where
 
         // Break runs at gaps in logical order and at MAX_RUN_SECTORS.
         csum_provider.range(logical_lo, logical_hi, counters, |e| {
-            if pipeline_failed.get() {
+            if pipeline_failed.get()
+                || crate::cancel::signal_requested()
+                || cancel.is_some_and(|c| c.requested())
+            {
                 return;
             }
             let contiguous = match prev_logical {
@@ -388,6 +404,12 @@ where
         eprintln!("error: scrub reader thread panicked — results are incomplete");
         pipeline_failed.set(true);
     }
+    if crate::cancel::signal_requested() || cancel.is_some_and(|c| c.requested()) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "scrub cancelled by signal",
+        ));
+    }
     if pipeline_failed.get() {
         return Err(io::Error::other(
             "scrub pipeline failed: the reader thread died or responses were lost — \
@@ -411,6 +433,7 @@ fn scrub_dev_tree_inline<F>(
     batch: bool,
     counters: Option<&StatusCounters>,
     mut on_sector: F,
+    cancel: Option<&crate::cancel::CancelToken>,
 ) -> ScrubStats
 where
     F: FnMut(&SectorResult),
@@ -420,6 +443,9 @@ where
     let sz = sector_size as usize;
 
     for dext in dev_extents {
+        if crate::cancel::signal_requested() || cancel.is_some_and(|c| c.requested()) {
+            break;
+        }
         let chunk = match chunk_map.info(dext.chunk_offset) {
             Some(c) => c,
             None => continue,

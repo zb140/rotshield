@@ -155,6 +155,7 @@ impl fs::FilesystemScrub for BtrfsScrub {
     /// mismatched sector.
     fn run(&mut self, callbacks: &mut dyn crate::fs::ScrubCallbacks) -> io::Result<ScrubStats> {
         let batch = callbacks.wants_raw_candidates();
+        let cancel = callbacks.cancellation_token();
 
         let block_size = self.strategy.sector_size as usize;
         let mut emit = |r: &crate::btrfs::scrub::SectorResult| {
@@ -212,6 +213,7 @@ impl fs::FilesystemScrub for BtrfsScrub {
             batch,
             self.status.as_deref(),
             &mut emit,
+            cancel.as_ref(),
         )?;
 
         Ok(ScrubStats {

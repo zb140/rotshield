@@ -5,6 +5,7 @@ pub mod array;
 pub mod batch_recover;
 pub mod btrfs;
 pub mod canary;
+pub mod cancel;
 pub mod freeze;
 pub mod fs;
 pub mod recovery;

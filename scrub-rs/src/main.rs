@@ -5,6 +5,7 @@
 
 use scrub_rs::array;
 use scrub_rs::btrfs;
+use scrub_rs::cancel;
 use scrub_rs::fs;
 use scrub_rs::fs::FilesystemScrub;
 
@@ -41,6 +42,11 @@ fn main() -> ExitCode {
 
     if dev == "--dump-array" {
         return dump_array();
+    }
+
+    if let Err(e) = cancel::install_shutdown_signals() {
+        eprintln!("error installing shutdown signal handlers: {e}");
+        return ExitCode::from(EXIT_RUNTIME_ERROR);
     }
 
     run_scrub(dev, args)
@@ -295,10 +301,15 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
         scrub_slot: u64,
 
         sent: Arc<AtomicU64>,
+        cancel: scrub_rs::cancel::CancelToken,
     }
     impl fs::ScrubCallbacks for Driver {
         fn wants_raw_candidates(&self) -> bool {
             self.tx.is_some()
+        }
+
+        fn cancellation_token(&self) -> Option<scrub_rs::cancel::CancelToken> {
+            Some(self.cancel.clone())
         }
 
         fn on_log(&mut self, line: &str) {
@@ -336,19 +347,22 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
             };
 
             if let Err(e) = tx.send(scrub_rs::batch_recover::Msg::Candidate(cand)) {
-                eprintln!("error: recovery writer thread gone: {e}");
+                eprintln!("error: recovery pipeline candidate send failed: {e}");
+                self.cancel.request();
             } else {
                 self.sent.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
 
+    let cancel = crate::cancel::CancelToken::new();
     let sent = Arc::new(AtomicU64::new(0));
     let mut driver = Driver {
         cfg: cfg.clone(),
         tx: None,
         scrub_slot,
         sent: sent.clone(),
+        cancel: cancel.clone(),
     };
 
     // Freeze only matters for live repair writes; offline and dry-run
@@ -398,6 +412,7 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
             std::time::Duration::from_secs_f64(batch_idle),
             std::time::Duration::from_secs_f64(freeze_max),
             Some(status.clone()),
+            cancel.clone(),
         ) {
             Ok(v) => v,
             Err(e) => {
@@ -426,50 +441,96 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
     }
 
     status.set_state("running");
-    let stats = match scrub.run(&mut driver) {
+    let scrub_result = scrub.run(&mut driver);
+
+    if scrub_result.is_err() || cancel.requested() {
+        // Stop queued and in-progress recovery work before shutting down
+        // the pipeline. The writer still gets joined so any active
+        // filesystem freeze can be released.
+        cancel.request();
+    }
+
+    // Shut down the recovery pipeline regardless of scrub success or failure.
+    // The writer must finish (including filesystem thaw) before we return.
+    let had_writer = writer_handle.is_some();
+    let mut batch_stats = scrub_rs::batch_recover::BatchStats::default();
+
+    if let Some(tx) = driver.tx.take() {
+        if scrub_result.is_ok() && !cancel.requested() {
+            let _ = tx.send(scrub_rs::batch_recover::Msg::Done);
+        }
+        // On scrub failure, disconnect without sending Done.
+        // The accumulator discards its incomplete batch, and cancellation
+        // prevents the writer from starting further repairs.
+    }
+
+    let accumulator_panicked = if let Some(acc) = acc_handle.take() {
+        acc.join().is_err()
+    } else {
+        false
+    };
+
+    // Join the writer even if the accumulator panicked.
+    let writer_result = writer_handle.take().map(|writer| writer.join());
+
+    // Report the sticky safety interlock before any fatal result handling,
+    // independently of whether a final status block can be produced.
+    if status.thaw_failed.load(Ordering::Relaxed) != 0 {
+        eprintln!("thaw_failed=1");
+    } else if !matches!(&writer_result, Some(Err(_))) {
+        // Both workers have joined. A normal writer error still completes
+        // guard cleanup, but a panic cannot certify that cleanup succeeded.
+        eprintln!("repair_cleanup=complete");
+    }
+
+    // Evaluate all results only after both workers have finished.
+    let mut pipeline_failed = false;
+
+    if accumulator_panicked {
+        eprintln!("error: recovery accumulator thread panicked — results are incomplete");
+        pipeline_failed = true;
+    }
+
+    match writer_result {
+        Some(Ok(Ok(s))) => batch_stats = s,
+        Some(Ok(Err(e))) => {
+            eprintln!("error: recovery pipeline aborted: {e}");
+            pipeline_failed = true;
+        }
+        Some(Err(_)) => {
+            eprintln!(
+                "error: recovery writer thread panicked — filesystem thaw status may be uncertain"
+            );
+            pipeline_failed = true;
+        }
+        None => {}
+    }
+
+    if pipeline_failed {
+        status.set_state("error");
+        print_status_block(&status);
+        return ExitCode::from(EXIT_RUNTIME_ERROR);
+    }
+
+    if cancel.requested() {
+        eprintln!("error: scrub interrupted by cancellation or shutdown signal");
+        status.set_state("error");
+        print_status_block(&status);
+        return ExitCode::from(EXIT_RUNTIME_ERROR);
+    }
+
+    let stats = match scrub_result {
         Ok(s) => s,
         Err(e) => {
-            status.set_state("error");
             eprintln!("error running scrub: {e}");
+            // No valid scrub statistics to reconcile or report.
+            status.set_state("error");
             print_status_block(&status);
             return ExitCode::from(EXIT_RUNTIME_ERROR);
         }
     };
 
-    status.set_state("done");
-    // Shut the pipeline down: send Done, drain the accumulator, join the
-    // writer.
-    let had_writer = writer_handle.is_some();
-    let mut batch_stats = scrub_rs::batch_recover::BatchStats::default();
     if had_writer {
-        if let Some(tx) = driver.tx.take() {
-            let _ = tx.send(scrub_rs::batch_recover::Msg::Done);
-        }
-
-        if let Some(acc) = acc_handle.take()
-            && acc.join().is_err()
-        {
-            eprintln!("error: recovery accumulator thread panicked — results are incomplete");
-            status.set_state("error");
-            print_status_block(&status);
-            return ExitCode::from(EXIT_RUNTIME_ERROR);
-        }
-        match writer_handle.take().unwrap().join() {
-            Ok(Ok(s)) => batch_stats = s,
-            Ok(Err(e)) => {
-                eprintln!("error: recovery pipeline aborted: {e}");
-                status.set_state("error");
-                print_status_block(&status);
-                return ExitCode::from(EXIT_RUNTIME_ERROR);
-            }
-            Err(_) => {
-                eprintln!("error: recovery writer thread panicked — results are incomplete");
-                status.set_state("error");
-                print_status_block(&status);
-                return ExitCode::from(EXIT_RUNTIME_ERROR);
-            }
-        }
-
         // Every candidate handed to the pipeline must be classified into
         // exactly one bucket; a shortfall means a thread died mid-run.
         let classified =
@@ -604,6 +665,7 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
         ExitCode::from(EXIT_ISSUES_FOUND)
     };
 
+    status.set_state("done");
     print_status_block(&status);
     code
 }
