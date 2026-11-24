@@ -139,7 +139,7 @@ fn extent_covers(
             )
             .ok();
         let node = match res {
-            Some(r) if !r.all_mirrors_failed => r.node.unwrap(),
+            Some(r) if !r.all_mirrors_failed && !r.generation_mismatch => r.node.unwrap(),
             _ => return ExtentLive::Unreadable,
         };
         match node {
@@ -226,7 +226,7 @@ fn csum_at(
             )
             .ok();
         let node = match res {
-            Some(r) if !r.all_mirrors_failed => r.node.unwrap(),
+            Some(r) if !r.all_mirrors_failed && !r.generation_mismatch => r.node.unwrap(),
             _ => return CsumLive::Unreadable,
         };
         match node {
