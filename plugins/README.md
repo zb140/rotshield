@@ -102,7 +102,7 @@ bash pkg_build.sh
    locally per above).
 3. Install the plugin via the unRAID webUI (Plugins → Install Plugin, paste the
    raw `.plg` URL), or drop the `.plg` on the flash drive and install it.
-3. Open **Utilities → Rotshield**, select the target raw data
+4. Open **Utilities → Rotshield**, select the target raw data
    disk(s) (auto-discovered from the array's `/proc/nmdstat`; the partition
    offset and freeze mount are applied automatically), choose recovery mode
    and write vs dry-run, optionally pick a schedule, and click **Run Scrub
@@ -113,11 +113,11 @@ bash pkg_build.sh
 The Settings page writes these INI-style keys; `scripts/scrub.sh` turns them
 into `scrub-rs` arguments (see `scrub-rs/src/main.rs` for the full flag list):
 
-| Key | Meaning | scrub-rs flag |
-|-----|---------|---------------|
+| Key       | Meaning                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             | scrub-rs flag            |
+| --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------ |
 | `DEVICES` | space-separated list of **raw array data-disk rdevs** to scrub **sequentially** (e.g. `/dev/sdX`, `/dev/nvmeXnY`, `/dev/loopX` — whatever `/proc/nmdstat` reports in `rdevName.N` for the data slots; parity slots 0 and 29 are excluded). Scrub order = the listed order (config is the single source of truth); the Settings page stores them alphabetically. **No target is preselected on a fresh install** (empty list = the table stays empty and scrubbing is skipped until you pick a disk) | `<device>` (one per run) |
-| `DEVICE` | first entry of `DEVICES` (kept for backwards compatibility) | `<device>` |
-| `WRITE` | `1` writes reconstructed blocks back (`--repair`); `0` (default) dry-run assessment only | `--repair` |
+| `DEVICE`  | first entry of `DEVICES` (kept for backwards compatibility)                                                                                                                                                                                                                                                                                                                                                                                                                                         | `<device>`               |
+| `WRITE`   | `1` writes reconstructed blocks back (`--repair`); `0` (default) dry-run assessment only                                                                                                                                                                                                                                                                                                                                                                                                            | `--repair`               |
 
 Recovery assessment is **always on** (free + read-only): every csum mismatch is
 reconstructed from parity so the operator learns whether the corruption is
@@ -126,9 +126,9 @@ reconstruction back to the failing disk.
 
 The `--freeze-mount` argument is **auto-detected per device** at run time:
 `scrub.sh` looks up each disk's live mountpoint via `findmnt` and passes it to
-`scrub-rs`, so there is no manual freeze-mount setting. Freeze only engages
-when repairing (`--repair`) on a mounted filesystem; unmounted images are never
-frozen.
+`scrub-rs`, so there is no manual freeze-mount setting. Plugin-managed repair
+refuses a device when no live mountpoint can be resolved; offline repair remains
+available through the standalone CLI. Freeze only engages for actual repair.
 
 The partition offset (`--offset`) is **auto-applied per device** from
 `/proc/nmdstat`: `scrub.sh` reads `rdevOffset.N` for each target rdev and passes
@@ -136,17 +136,32 @@ The partition offset (`--offset`) is **auto-applied per device** from
 superblock lives at that offset on the raw device (not at 0, as it would on the
 array partition `/dev/nmdNp1`). There is nothing for the user to set — and no
 fallback, because without a valid offset recovery is impossible anyway.
-| `EXTRA_OPTIONS` | appended verbatim (advanced) | — |
+| `EXTRA_OPTIONS` | validated tuning/status options only; cannot override repair, freeze, target, or offset policy | — |
 | `SCHEDULE` | `disabled` / `weekly` / `monthly` / `custom` | (cron) |
 | `CRON` | 5-field cron time spec (`min hour day month weekday`), used only when `SCHEDULE=custom` (e.g. `0 4 1 * *` = 04:00 on the 1st). `daily` is intentionally not offered — a scrub can take days and would overlap its own previous run. | (cron) |
 
-The freeze and batch settings are not config keys: their safe defaults
-(freeze on for live repairs, batch max 64, batch idle 5 s) are baked into
-scrub-rs and cannot be hand-set in `config.cfg`. The only way to override
-them is to pass the flags (`--no-freeze`, `--batch-max`, `--batch-idle`)
-via `EXTRA_OPTIONS`. The same applies to the live-status socket path:
-`--status-sock <path>` in `EXTRA_OPTIONS` moves it (scrub.sh resolves the
-override for its own polling, so the page keeps working).
+The plugin owns repair authorization (`WRITE=0` or `WRITE=1`), freeze policy,
+freeze mount selection, and partition offsets. `EXTRA_OPTIONS` accepts only
+`--batch-max`, `--batch-idle`, `--freeze-max`, and `--status-sock`, with either
+`--flag value` or `--flag=value` syntax. Duplicate flags, invalid values, and
+policy overrides such as `--repair`, `--no-freeze`, `--freeze-mount`, and
+`--offset` are refused before scanner launch. Existing configs using those
+unsafe overrides must be corrected rather than silently reinterpreted.
+
+Values are plain whitespace-delimited tokens, not shell syntax: shell quotes,
+escapes, and glob expansion are not interpreted. The status socket must be an
+absolute path. Batch maximum is a positive decimal integer (at most nine digits);
+idle/freeze windows are plain decimal seconds (at most twelve characters), idle
+nonnegative and freeze positive. NaN, infinity, and scientific notation are not
+accepted. The recorded socket remains in use for status/Stop if config changes
+mid-run.
+
+In repair mode, fatal runtime/usage/metadata errors stop the whole sequential
+job; ordinary data findings do not. Unconfirmed cleanup or a reported thaw
+failure retains the run lock for manual verification and sends a partial-results
+alert. See [runner safety qualification](../tests/RUNNER-SAFETY.md) for exact
+behavior and remaining live-fixture qualification. This does not yet qualify
+automatic production repair.
 
 ### Live status + per-disk progress table
 

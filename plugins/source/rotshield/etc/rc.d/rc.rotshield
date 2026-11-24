@@ -7,60 +7,64 @@
 # schedule, `stop` clears it, `restart` re-applies.
 
 PLUGIN="rotshield"
-PLUGIN_DIR="/usr/local/emhttp/plugins/${PLUGIN}"
-CONFIG_DIR="/boot/config/plugins/${PLUGIN}"
+PLUGIN_DIR="${ROTSHIELD_PLUGIN_DIR:-${PLUGIN_DIR:-/usr/local/emhttp/plugins/${PLUGIN}}}"
+CONFIG_DIR="${ROTSHIELD_CONFIG_DIR:-/boot/config/plugins/${PLUGIN}}"
 CONFIG_FILE="${CONFIG_DIR}/config.cfg"
-CRON_FILE="/etc/cron.d/${PLUGIN}"
+CRON_FILE="${ROTSHIELD_CRON_DIR:-/etc/cron.d}/${PLUGIN}"
+MONITOR_CRON_FILE="${ROTSHIELD_CRON_DIR:-/etc/cron.d}/${PLUGIN}-monitor"
 
 install_cron() {
-  # Config is sourced dynamically (key=value, both bash and PHP INI parsable).
-  # shellcheck disable=SC1090
-  [ -f "${CONFIG_FILE}" ] && . "${CONFIG_FILE}"
-  rm -f "${CRON_FILE}"
-  case "${SCHEDULE:-disabled}" in
+    # Config is sourced dynamically (key=value, both bash and PHP INI parsable).
+    # shellcheck disable=SC1090
+    [ -f "${CONFIG_FILE}" ] && . "${CONFIG_FILE}"
+    rm -f "${CRON_FILE}"
+    case "${SCHEDULE:-disabled}" in
     weekly)
-      # scrub.sh appends the full run log to /var/log/$PLUGIN.log itself, so
-      # the cron entry just invokes the run, no redirection.
-      echo "0 3 * * 0 root ${PLUGIN_DIR}/scripts/scrub.sh run" > "${CRON_FILE}"
-      ;;
+        # scrub.sh appends the full run log to /var/log/$PLUGIN.log itself, so
+        # the cron entry just invokes the run, no redirection.
+        echo "0 3 * * 0 root ROTSHIELD_SCHEDULED=1 ${PLUGIN_DIR}/scripts/scrub.sh run" >"${CRON_FILE}"
+        ;;
     monthly)
-      # A scrub can take days, so monthly is a sane preset for large arrays.
-      # Runs at 03:00 on the 1st of each month.
-      echo "0 3 1 * * root ${PLUGIN_DIR}/scripts/scrub.sh run" > "${CRON_FILE}"
-      ;;
+        # A scrub can take days, so monthly is a sane preset for large arrays.
+        # Runs at 03:00 on the 1st of each month.
+        echo "0 3 1 * * root ROTSHIELD_SCHEDULED=1 ${PLUGIN_DIR}/scripts/scrub.sh run" >"${CRON_FILE}"
+        ;;
     custom)
-      # CRON holds a validated 5-field time spec from the Settings page.
-      if [ -n "${CRON:-}" ]; then
-        echo "${CRON} root ${PLUGIN_DIR}/scripts/scrub.sh run" > "${CRON_FILE}"
-      fi
-      ;;
+        # CRON holds a validated 5-field time spec from the Settings page.
+        if [ -n "${CRON:-}" ]; then
+            echo "${CRON} root ROTSHIELD_SCHEDULED=1 ${PLUGIN_DIR}/scripts/scrub.sh run" >"${CRON_FILE}"
+        fi
+        ;;
     *)
-      # disabled — no cron entry
-      ;;
-  esac
-  chmod 644 "${CRON_FILE}" 2>/dev/null
+        # disabled — no cron entry
+        ;;
+    esac
+    chmod 644 "${CRON_FILE}" 2>/dev/null || :
+    # Monitor manual runs too, even when the automatic schedule is disabled.
+    echo "* * * * * root ${PLUGIN_DIR}/scripts/notify-monitor.sh" >"${MONITOR_CRON_FILE}"
+    chmod 644 "${MONITOR_CRON_FILE}"
 }
 
 remove_cron() {
-  rm -f "${CRON_FILE}"
+    rm -f "${CRON_FILE}" "${MONITOR_CRON_FILE}"
 }
 
 start() {
-  install_cron
+    install_cron
 }
 
 stop() {
-  remove_cron
+    remove_cron
 }
 
 restart() {
-  stop
-  start
+    stop
+    start
 }
 
 case "$1" in
-  start)   start ;;
-  stop)    stop ;;
-  restart) restart ;;
-  *) echo "usage $0 start|stop|restart" ;;
+start) start ;;
+stop) stop ;;
+restart) restart ;;
+*) echo "usage $0 start|stop|restart" ;;
 esac
