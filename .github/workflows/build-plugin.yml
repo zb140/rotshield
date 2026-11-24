@@ -13,7 +13,7 @@ name: Build unRAID Plugin
 on:
   push:
     branches: [main]
-    tags: ['v*']
+    tags: ["v*"]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -39,7 +39,10 @@ jobs:
       - name: Unit tests (cheap gate before packaging)
         run: |
           cd scrub-rs
-          cargo test --release
+          cargo test --locked --release
+
+      - name: Runner notification and shutdown regressions
+        run: python3 tests/notifications_test.py
 
       - name: Build scrub-rs (gnu)
         run: |
@@ -47,7 +50,7 @@ jobs:
           # Only scrub-rs is built for the plugin. craft-corrupt is a
           # dangerous test-only utility and must never be built or shipped
           # here — it is built only by scrub-rs-tests.yml for the test array.
-          cargo build --release --bin scrub-rs
+          cargo build --locked --release --bin scrub-rs
           ls -l target/release/scrub-rs
 
       - name: Stage binaries into plugin tree
@@ -64,26 +67,52 @@ jobs:
           fi
           file "$BIN_DIR/scrub-rs"
 
+      - name: Record scanner build provenance
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, subprocess
+          root = pathlib.Path('plugins/source/rotshield/usr/local/emhttp/plugins/rotshield')
+          binary = root / 'bin/scrub-rs'
+          info = {
+              'source_commit': os.environ['GITHUB_SHA'],
+              'repository': os.environ['GITHUB_REPOSITORY'],
+              'scanner_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(),
+              'rustc': subprocess.check_output(['rustc', '--version', '--verbose'], text=True).strip(),
+              'build_command': 'cargo build --locked --release --bin scrub-rs',
+              'test_array_feature_enabled': False,
+          }
+          (root / 'build-info.json').write_text(json.dumps(info, indent=2, sort_keys=True) + '\n')
+          PY
+
       - name: Package bundle (.txz)
         run: |
           cd plugins/source/rotshield
           bash pkg_build.sh
           ls -l ../../archive/
 
-      - name: Compute md5 and inject into .plg
+      - name: Generate SHA-256-pinned release manifest
         run: |
-          VERSION=$(sed -n 's/.*<!ENTITY version[[:space:]]*"\([^"]*\)".*/\1/p' plugins/rotshield.plg | head -1)
-          TXZ="plugins/archive/rotshield-${VERSION}-x86_64-1.txz"
-          MD5=$(md5sum "$TXZ" | awk '{print $1}')
-          echo "bundle: $TXZ"
-          echo "bundle md5: $MD5"
-          # No md5 is pinned in the .plg on purpose: the plg is served from
-          # the main branch, but the bundle is only built when the release
-          # tag is pushed, so its checksum is unknowable at commit time. (A
-          # stale md5 in the committed plg would reject every download and
-          # break updates.) Integrity is HTTPS + upgradepkg failing loudly
-          # on a corrupt archive.
-          echo "MD5=$MD5" >> "$GITHUB_ENV"
+          python3 - <<'PY'
+          import hashlib, pathlib, re, shutil, xml.etree.ElementTree as ET
+          source = pathlib.Path('plugins/rotshield.plg').read_text()
+          version = re.search(r'<!ENTITY version\s+"([^"]+)">', source).group(1)
+          archive = pathlib.Path('plugins/archive')
+          bundle = archive / f'rotshield-{version}-x86_64-1.txz'
+          digest = hashlib.sha256(bundle.read_bytes()).hexdigest()
+          manifest, count = re.subn(r'<!ENTITY sha256\s+"[^"]*">', f'<!ENTITY sha256 "{digest}">', source)
+          assert count == 1
+          parsed = ET.fromstring(manifest)
+          package = next(item for item in parsed.findall('FILE') if item.find('SHA256') is not None)
+          assert package.findtext('SHA256') == digest
+          assert package.findtext('URL').endswith('/' + bundle.name)
+          (archive / 'rotshield.plg').write_text(manifest)
+          shutil.copyfile('plugins/source/rotshield/usr/local/emhttp/plugins/rotshield/build-info.json', archive / 'build-info.json')
+          assets = [bundle.name, 'rotshield.plg', 'build-info.json']
+          (archive / 'SHA256SUMS').write_text(''.join(
+              hashlib.sha256((archive / name).read_bytes()).hexdigest() + '  ' + name + '\n'
+              for name in assets))
+          print(f'Pinned {bundle.name}: {digest}')
+          PY
 
       - name: Verify release tag matches plugin version
         if: startsWith(github.ref, 'refs/tags/v')
@@ -100,14 +129,28 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: rotshield-bundle
-          path: plugins/archive/*.txz
+          path: |
+            plugins/archive/*.txz
+            plugins/archive/rotshield.plg
+            plugins/archive/build-info.json
+            plugins/archive/SHA256SUMS
           if-no-files-found: error
 
       - name: Publish to GitHub Release (on tag)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: plugins/archive/*.txz
+          files: |
+            plugins/archive/*.txz
+            plugins/archive/rotshield.plg
+            plugins/archive/build-info.json
+            plugins/archive/SHA256SUMS
+          prerelease: true
+          body: |
+            Personal RotShield build from ${{ github.sha }}. Retains upstream attribution.
+            Install rotshield.plg from these release assets, not the source template.
+            Existing configuration is preserved; installing does not enable repair.
+            The update URL is pinned to this release; subsequent upgrades are manual.
           # Auto-generate release notes from the conventional commits since
           # the last release. The asset is named after the .plg version
           # (pkg_build.sh derives it from the plg) and the verification step
