@@ -455,14 +455,15 @@ fn run_scrub<I: Iterator<Item = String>>(dev: String, args: I) -> ExitCode {
     let had_writer = writer_handle.is_some();
     let mut batch_stats = scrub_rs::batch_recover::BatchStats::default();
 
-    if let Some(tx) = driver.tx.take() {
-        if scrub_result.is_ok() && !cancel.requested() {
-            let _ = tx.send(scrub_rs::batch_recover::Msg::Done);
-        }
-        // On scrub failure, disconnect without sending Done.
-        // The accumulator discards its incomplete batch, and cancellation
-        // prevents the writer from starting further repairs.
+    if let Some(tx) = driver.tx.take()
+        && scrub_result.is_ok()
+        && !cancel.requested()
+    {
+        let _ = tx.send(scrub_rs::batch_recover::Msg::Done);
     }
+    // On scrub failure, disconnect without sending Done.
+    // The accumulator discards its incomplete batch, and cancellation
+    // prevents the writer from starting further repairs.
 
     let accumulator_panicked = if let Some(acc) = acc_handle.take() {
         acc.join().is_err()

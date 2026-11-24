@@ -317,9 +317,6 @@ impl FsReader {
             return false;
         }
 
-        if expected_generation != GEN_DONT_CHECK && hdr.generation != expected_generation {
-            return false;
-        }
-        true
+        expected_generation == GEN_DONT_CHECK || hdr.generation == expected_generation
     }
 }
