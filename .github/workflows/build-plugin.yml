@@ -44,6 +44,13 @@ jobs:
       - name: Runner notification and shutdown regressions
         run: python3 tests/notifications_test.py
 
+      - name: API results and shared parser regressions
+        run: |
+          php -l plugins/source/rotshield/usr/local/emhttp/plugins/rotshield/scripts/results.php
+          php -l plugins/source/rotshield/usr/local/emhttp/plugins/rotshield/scripts/status-parser.php
+          php -l plugins/source/rotshield/usr/local/emhttp/plugins/rotshield/status.php
+          python3 plugins/source/rotshield/usr/local/emhttp/plugins/rotshield/scripts/rotshield-results-harness.py
+
       - name: Build scrub-rs (gnu)
         run: |
           cd scrub-rs

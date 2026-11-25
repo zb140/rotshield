@@ -3,8 +3,8 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name          "rotshield">
 <!ENTITY author        "digi-deity">
-<!ENTITY version       "2026.11.19a">
-<!ENTITY bundleversion "2026.11.19a">
+<!ENTITY version       "2026.11.24a">
+<!ENTITY bundleversion "2026.11.24a">
 <!ENTITY launch        "Utilities/rotshield">
 <!ENTITY pluginURL     "https://github.com/zb140/rotshield/releases/download/v&version;/rotshield.plg">
 <!ENTITY bundlefile    "rotshield-&version;-x86_64-1.txz">
@@ -18,6 +18,14 @@
 
 <CHANGES>
 ##&name;
+
+###2026.11.24a — API-support build
+- Persist latest per-disk scan outcomes and counters in results.json, keyed by stable array disk identity.
+- Preserve partial cancellation results and previously completed disk results.
+- Share status-log parsing between the existing UI endpoint and results writer.
+- Include results.php and status-parser.php for the separate unraid-api plugin to consume.
+- Existing monthly schedule and write mode are preserved; no scan or repair is started by installation.
+- Update URL remains pinned to this personal release; install the generated release asset.
 
 ###2026.11.19a — personal build
 - Personal zb140 build; retains upstream RotShield attribution and plugin identity.

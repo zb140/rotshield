@@ -73,6 +73,8 @@ files=(
     "$runtime/scripts/scrub.sh"
     "$runtime/scripts/notify-common.sh"
     "$runtime/scripts/notify-monitor.sh"
+    "$runtime/scripts/results.php"
+    "$runtime/scripts/status-parser.php"
 )
 for path in "${files[@]}"; do
     [ -f "$path" ] || {
