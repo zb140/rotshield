@@ -163,6 +163,28 @@ alert. See [runner safety qualification](../tests/RUNNER-SAFETY.md) for exact
 behavior and remaining live-fixture qualification. This does not yet qualify
 automatic production repair.
 
+### Persistent results for API consumers
+
+The runner records the latest outcome for each physical disk in
+`/boot/config/plugins/rotshield/results.json` (`schema_version: 1`, a `disks`
+object keyed by the array's persistent `rdevId`). Records include the current
+device/array slot, UTC start/finish timestamps, outcome, exit code, whether
+repair was enabled, and available scanner counters. If there is no matching
+status block, `counters` is `null`; unavailable individual keys remain absent,
+not invented as zero. Other disks' records are preserved.
+
+Results are written on disk completion, failure, or cancellation, not for every
+progress update. A missing results file is normal before the first recorded
+result; old run logs are not automatically backfilled. Use the live-status
+interface below for an active scan. `scrub.sh disk-id <device>` resolves the
+persistent identity without falling back to a transient `/dev/sdX` name.
+
+The shared PHP parser and results writer support a separate `unraid-api`
+plugin; this package does not install or register that API plugin. Consumers
+should read the results file and retain the distinction between recoverable
+blocks and verified repairs. The results harness is test source only and is
+not included in the installed runtime package.
+
 ### Live status + per-disk progress table
 
 While a scrub runs, scrub-rs serves the live error counters over a

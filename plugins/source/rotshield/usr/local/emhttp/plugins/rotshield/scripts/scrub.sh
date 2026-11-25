@@ -81,7 +81,11 @@ repair_aborted=0
 build_args() {
     SCRUB_ARGS=()
     STATUS_SOCKET=/var/run/rotshield/status.sock
-    case "${WRITE-0}" in 0|1) ;; *) echo 'REFUSED: WRITE must be 0 or 1' >&2; return 2 ;; esac
+    case "${WRITE-0}" in 0 | 1) ;; *)
+        echo 'REFUSED: WRITE must be 0 or 1' >&2
+        return 2
+        ;;
+    esac
     local extra="${EXTRA_OPTIONS:-}" key value token
     local -a tokens=() tuning=()
     local -A seen=()
@@ -89,34 +93,48 @@ build_args() {
         echo 'REFUSED: extra options must be on one line' >&2
         return 2
     fi
-    read -r -a tokens <<< "$extra"
+    read -r -a tokens <<<"$extra"
     set -- "${tokens[@]}"
     while [ "$#" -gt 0 ]; do
-        token="$1"; shift
+        token="$1"
+        shift
         key="${token%%=*}"
         case "$key" in
-            --status-sock|--batch-max|--batch-idle|--freeze-max) ;;
-            *) echo "REFUSED: plugin does not allow extra option $key" >&2; return 2 ;;
+        --status-sock | --batch-max | --batch-idle | --freeze-max) ;;
+        *)
+            echo "REFUSED: plugin does not allow extra option $key" >&2
+            return 2
+            ;;
         esac
         if [ -n "${seen[$key]:-}" ]; then
-            echo "REFUSED: duplicate extra option $key" >&2; return 2
+            echo "REFUSED: duplicate extra option $key" >&2
+            return 2
         fi
         seen[$key]=1
         if [[ "$token" == *=* ]]; then
             value="${token#*=}"
         else
-            [ "$#" -gt 0 ] || { echo "REFUSED: $key needs a value" >&2; return 2; }
-            value="$1"; shift
+            [ "$#" -gt 0 ] || {
+                echo "REFUSED: $key needs a value" >&2
+                return 2
+            }
+            value="$1"
+            shift
         fi
         case "$key" in
-            --status-sock) [[ "$value" == /* && "$value" != / ]] || return 2
-                STATUS_SOCKET="$value" ;;
-            --batch-max) [[ "$value" =~ ^[0-9]+$ && "$value" =~ [1-9] && ${#value} -le 9 ]] || return 2
-                tuning+=("$key" "$value") ;;
-            --batch-idle|--freeze-max)
-                [[ "$value" =~ ^[0-9]+([.][0-9]+)?$ && ${#value} -le 12 ]] || return 2
-                if [ "$key" = --freeze-max ] && [[ ! "$value" =~ [1-9] ]]; then return 2; fi
-                tuning+=("$key" "$value") ;;
+        --status-sock)
+            [[ "$value" == /* && "$value" != / ]] || return 2
+            STATUS_SOCKET="$value"
+            ;;
+        --batch-max)
+            [[ "$value" =~ ^[0-9]+$ && "$value" =~ [1-9] && ${#value} -le 9 ]] || return 2
+            tuning+=("$key" "$value")
+            ;;
+        --batch-idle | --freeze-max)
+            [[ "$value" =~ ^[0-9]+([.][0-9]+)?$ && ${#value} -le 12 ]] || return 2
+            if [ "$key" = --freeze-max ] && [[ ! "$value" =~ [1-9] ]]; then return 2; fi
+            tuning+=("$key" "$value")
+            ;;
         esac
     done
     [ "${WRITE:-0}" = 1 ] && SCRUB_ARGS+=(--repair)
@@ -169,6 +187,38 @@ array_slot_for() {
     done <"$stat"
 
     return 1
+}
+
+# Resolve the persistent physical disk identity from the array table.
+# Never fall back to a transient /dev/sdX name.
+disk_id_for() {
+    local device="$1" slot stat p
+
+    slot="$(array_slot_for "$device")"
+    [ -n "$slot" ] || return 1
+
+    for p in "${PROC_NMDSTAT:-}" /proc/nmdstat /proc/mdstat; do
+        if [ -n "$p" ] && [ -f "$p" ]; then
+            stat="$p"
+            break
+        fi
+    done
+
+    [ -n "${stat:-}" ] || return 1
+
+    awk -F= -v s="$slot" '
+        $1 == "rdevId." s {
+            id = substr($0, index($0, "=") + 1)
+            sub(/^[[:space:]]+/, "", id)
+            sub(/[[:space:]]+$/, "", id)
+            if (id != "") {
+                print id
+                found = 1
+            }
+            exit
+        }
+        END { exit !found }
+    ' "$stat"
 }
 
 # Resolve the live filesystem mountpoint for a raw array member.
@@ -389,7 +439,7 @@ scrub_one_device() {
     shift 3
     local -a dev_opts=("$@")
     local off fm rc status dev_log
-
+    local disk_id="" disk_slot="" started_at="" outcome="error"
 
     # Target the RAW rdev: scrub-rs reads the btrfs superblock at the partition
     # offset, so we pass --offset +<rdevOffset> (sectors) from /proc/nmdstat. If
@@ -420,22 +470,39 @@ scrub_one_device() {
         return 1
     fi
 
-
     # Serialize launch with Stop. A dedicated FIFO keeps the collector alive
     # until Rust has emitted its post-join thaw/cleanup records.
     local dev_tmp scanner_pid collector_pid launch_fd collector_rc
     dev_tmp="$(mktemp -d /tmp/rotshield-scan.XXXXXX)" || return 1
     dev_log="$dev_tmp/output"
-    mkfifo "$dev_tmp/stream" || { rmdir "$dev_tmp"; return 1; }
+    mkfifo "$dev_tmp/stream" || {
+        rmdir "$dev_tmp"
+        return 1
+    }
     exec {launch_fd}>"${RUNS_DIR}/.launch.lock"
-    flock -x "$launch_fd" || { exec {launch_fd}>&-; rm -rf "$dev_tmp"; return 1; }
+    flock -x "$launch_fd" || {
+        exec {launch_fd}>&-
+        rm -rf "$dev_tmp"
+        return 1
+    }
     if [ -e "${LOCK_DIR}/stop-pending" ]; then
         exec {launch_fd}>&-
         rm -rf "$dev_tmp"
         return 1
     fi
+    disk_id="$(disk_id_for "$device")"
+    disk_slot="$(array_slot_for "$device")"
+    started_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+
+    if [ -z "$disk_id" ] || [ -z "$disk_slot" ]; then
+        echo "WARNING: Cannot resolve disk identity for $device; result will not be persisted"
+    fi
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] ($idx/${total}) scrubbing ${device}"
+    rm -f "${LOCK_DIR}/disk-finalized"
     printf '%s\n' "$device" >"${LOCK_DIR}/active-device"
+    printf '%s\n' "$disk_id" >"${LOCK_DIR}/disk-id"
+    printf '%s\n' "$disk_slot" >"${LOCK_DIR}/disk-slot"
+    printf '%s\n' "$started_at" >"${LOCK_DIR}/disk-started-at"
     printf '%s\n' "$fm" >"${LOCK_DIR}/freeze-mount"
     printf '%s\n' "$dev_tmp" >"${LOCK_DIR}/scanner-temp"
     (
@@ -455,9 +522,20 @@ scrub_one_device() {
     wait "$collector_pid"
     collector_rc=$?
 
+    # Serialize disk finalization with Stop.
+    exec {launch_fd}>"${RUNS_DIR}/.launch.lock"
+    flock -x "$launch_fd" || {
+        exec {launch_fd}>&-
+        rm -rf "$dev_tmp"
+        errored=1
+        repair_aborted=1
+        return 1
+    }
+
     # Stop owns the partial snapshot and terminal record once pending is set.
     # Rust output has drained, so Stop can inspect its final safety markers.
     if [ -e "${LOCK_DIR}/stop-pending" ]; then
+        exec {launch_fd}>&-
         rm -rf "$dev_tmp"
         return "$rc"
     fi
@@ -483,7 +561,7 @@ scrub_one_device() {
         status="ERROR (rc=$rc; incomplete scanner output)"
         errored=1
         if [ "${WRITE:-0}" = 1 ] && [ ! -e "${LOCK_DIR}/stop-pending" ] &&
-           ! grep -qx 'repair_cleanup=complete' "$dev_log"; then
+            ! grep -qx 'repair_cleanup=complete' "$dev_log"; then
             retain_safety_lock 'Repair scanner did not complete; verify filesystem thaw before clearing lock'
         fi
         [ "$rc" -ne 0 ] || rc=1
@@ -502,11 +580,40 @@ scrub_one_device() {
         fi
     fi
     if [ "${WRITE:-0}" = 1 ]; then
-        case "$rc" in 0|3|4|5) ;; *) repair_aborted=1 ;; esac
+        case "$rc" in 0 | 3 | 4 | 5) ;; *) repair_aborted=1 ;; esac
     fi
     [ "$safety_pending" = 0 ] || repair_aborted=1
+    if [ "$collector_rc" -eq 0 ] &&
+        [ "$safety_pending" -eq 0 ] &&
+        grep -q '^scrub complete:' "$dev_log"; then
+        case "$rc" in
+        0) outcome="clean" ;;
+        3) outcome="issues" ;;
+        4) outcome="recoverable" ;;
+        5) outcome="unrecoverable" ;;
+        6) outcome="metadata_fatal" ;;
+        *) outcome="error" ;;
+        esac
+    fi
+
+    if [ -n "$disk_id" ] && [ -n "$disk_slot" ]; then
+        php "${PLUGIN_DIR}/scripts/results.php" \
+            "${CONFIG_DIR}/results.json" \
+            "$disk_id" \
+            "$device" \
+            "$disk_slot" \
+            "$started_at" \
+            "$outcome" \
+            "$rc" \
+            "${WRITE:-0}" \
+            "$dev_log" ||
+            echo "WARNING: Failed to persist result for $device"
+    fi
+
     rm -rf "$dev_tmp"
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] ($idx/${total}) ${device}: ${status}"
+    : >"${LOCK_DIR}/disk-finalized"
+    exec {launch_fd}>&-
 
     return "${rc}"
 }
@@ -530,7 +637,10 @@ run() {
     fi
     local total
     total=$(echo ${devlist} | wc -w)
-    build_args || { echo "REFUSED: invalid runner policy/options" >>"$LOG"; return 2; }
+    build_args || {
+        echo "REFUSED: invalid runner policy/options" >>"$LOG"
+        return 2
+    }
     local opts
     printf -v opts '%q ' "${SCRUB_ARGS[@]}"
     local start_ts
@@ -859,8 +969,19 @@ stop() {
         echo 'ERROR: stop already pending or cannot publish cancellation.'
         return 1
     fi
-    active_dev="$(cat "${LOCK_DIR}/active-device" 2>/dev/null)"
-    scanner_pid="$(cat "${LOCK_DIR}/scanner-pid" 2>/dev/null)"
+
+    local disk_id="" disk_slot="" started_at=""
+    active_dev=""
+    scanner_pid=""
+
+    if [ ! -e "${LOCK_DIR}/disk-finalized" ]; then
+        active_dev="$(cat "${LOCK_DIR}/active-device" 2>/dev/null)"
+        scanner_pid="$(cat "${LOCK_DIR}/scanner-pid" 2>/dev/null)"
+        disk_id="$(cat "${LOCK_DIR}/disk-id" 2>/dev/null)"
+        disk_slot="$(cat "${LOCK_DIR}/disk-slot" 2>/dev/null)"
+        started_at="$(cat "${LOCK_DIR}/disk-started-at" 2>/dev/null)"
+    fi
+
     mapfile -t tracked < <(collect_tree "$pid")
     if [[ "$scanner_pid" =~ ^[0-9]+$ ]] && tracked_alive "$scanner_pid"; then
         mapfile -t scanner_tree < <(collect_tree "$scanner_pid")
@@ -896,8 +1017,8 @@ stop() {
         killed=0
         echo "WARNING: a tracked scrub process is still running; refusing emergency thaw and lock removal."
     elif [ "${escalated}" -eq 1 ] && [ "$stop_write" != 0 ] && [ -n "$scanner_pid" ] &&
-         { ! last_scanner_has_marker 'repair_cleanup=complete' "$run_log" ||
-           last_scanner_has_marker 'thaw_failed=1' "$run_log"; }; then
+        { ! last_scanner_has_marker 'repair_cleanup=complete' "$run_log" ||
+            last_scanner_has_marker 'thaw_failed=1' "$run_log"; }; then
         # A SIGKILL cannot run Rust cleanup. Only attempt emergency thaw after
         # forced termination, and only for this run's identified filesystem.
         if ! thaw_frozen_mounts "${active_dev}"; then
@@ -912,7 +1033,7 @@ stop() {
     fi
 
     if [ "$stop_write" != 0 ] && [ "$escalated" = 0 ] &&
-       { [ -z "$run_log" ] || ! last_scanner_has_marker 'repair_cleanup=complete' "$run_log"; }; then
+        { [ -z "$run_log" ] || ! last_scanner_has_marker 'repair_cleanup=complete' "$run_log"; }; then
         # If no scanner was ever launched, there was no freeze to release.
         if [ -n "$scanner_pid" ]; then
             retain_safety_lock 'Repair shutdown cleanup was not confirmed; inspect filesystem before clearing lock'
@@ -923,6 +1044,29 @@ stop() {
     if [ -n "$run_log" ] && last_scanner_has_marker 'thaw_failed=1' "$run_log"; then
         retain_safety_lock 'Scanner reported failed thaw during shutdown; manual verification required'
     fi
+
+    if [ -n "$disk_id" ] && [ -n "$disk_slot" ] &&
+        [ -n "$started_at" ] && [ -n "$active_dev" ]; then
+        local outcome="cancelled"
+        [ "$safety_pending" = 0 ] || outcome="safety_abort"
+
+        php "${PLUGIN_DIR}/scripts/results.php" \
+            "${CONFIG_DIR}/results.json" \
+            "$disk_id" \
+            "$active_dev" \
+            "$disk_slot" \
+            "$started_at" \
+            "$outcome" \
+            1 \
+            "$stop_write" \
+            php://stdin <<EOF
+status:
+$(printf '%s\n' "$payload" | sed '/^state=/d; /^device=/d; /^$/d')
+state=cancelled
+device=${active_dev}
+EOF
+    fi
+
     notify_quiesce
     if [ "$safety_pending" = 1 ]; then
         if [ -n "$run_log" ]; then
@@ -941,35 +1085,35 @@ stop() {
     # other final block; the UI shows the aborted disk as cancelled with the
     # counters captured above.
     if [ -n "${run_log}" ]; then
+        # Safe: read the final byte before appending.
+        # shellcheck disable=SC2094
         {
             # Newline guard: if the killed process left the log ending mid-line,
             # start the append on a fresh line so the `status:` marker stays a
             # standalone line and the block parses.
             tail -c 1 "${run_log}" 2>/dev/null | grep -q . && echo
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] manual stop requested"
-            echo "status:"
-            if [ -n "${payload}" ]; then
-                # Keep the exact last counters; only the state line changes.  The
-                # trailing blank line the payload carries is dropped so the block
-                # stays a clean key=value run.
-                echo "${payload}" | sed 's/^state=.*/state=cancelled/' | sed '/^$/d'
-            else
-                echo "state=cancelled"
-                [ -n "${active_dev}" ] && echo "device=${active_dev}"
+            if [ -n "$active_dev" ]; then
+                echo "status:"
+                if [ -n "$payload" ]; then
+                    echo "$payload" | sed 's/^state=.*/state=cancelled/' | sed '/^$/d'
+                else
+                    echo "state=cancelled"
+                    echo "device=${active_dev}"
+                fi
             fi
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] finished: CANCELLED (manual stop)"
         } >>"${run_log}"
-        # CHECK: the cancelled block must actually be in the log (e.g. a full
-        # flash drive would silently drop the append).
-        if ! awk '
-      /^status:$/ { state = "" }
-      /^state=/ { state = $0 }
-      NF { last = $0 }
-      END {
-        exit !(state == "state=cancelled" &&
-               last ~ /finished: CANCELLED \(manual stop\)$/)
-      }
-    ' "${run_log}"; then
+
+        if ! awk -v active="$active_dev" '
+            /^status:$/ { state = "" }
+            /^state=/ { state = $0 }
+            NF { last = $0 }
+            END {
+                exit !((active == "" || state == "state=cancelled") &&
+                       last ~ /finished: CANCELLED \(manual stop\)$/)
+            }
+        ' "${run_log}"; then
             echo "WARNING: could not record the cancellation in the run log."
         fi
     fi
@@ -1048,7 +1192,8 @@ run) run ;;
 running) running ;;
 devices) devices ;;
 fstypes) fstypes ;;
+disk-id) disk_id_for "${2:-}" ;;
 status) status ;;
 stop) stop "${2:-}" ;;
-*) echo "usage: $0 run|running|devices|fstypes|status|stop" ;;
+*) echo "usage: $0 run|running|devices|fstypes|disk-id|status|stop" ;;
 esac

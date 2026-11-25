@@ -23,6 +23,8 @@
  * final blocks, then the live block, then meta — the live block wins for
  * the active disk.  Read-only; no user input reaches this script.
  */
+require_once __DIR__ . '/scripts/status-parser.php';
+
 $plugin     = "rotshield";
 $plugin_dir = "/usr/local/emhttp/plugins/$plugin";
 $config_dir = "/boot/config/plugins/$plugin";
@@ -61,41 +63,11 @@ if ($candidates) {
     $run_log = $candidates[0];
 }
 if ($run_log !== "" && is_file($run_log)) {
-    $fp = fopen($run_log, "r");
-    if ($fp) {
-        $cur = null;   // in-progress status block (device => kv map)
-        while (($line = fgets($fp)) !== false) {
-            $line = rtrim($line);
-            if ($line === "status:") {
-                if ($cur !== null) { $blocks[] = $cur; }
-                $cur = [];
-                continue;
-            }
-            if ($cur !== null) {
-                if (preg_match('/^([a-z_][a-z0-9_]*)=(.*)$/', $line, $m)) {
-                    $cur[$m[1]] = $m[2];
-                    continue;
-                }
-                $blocks[] = $cur;   // non-key=value line ends the block
-                $cur = null;
-            }
-            // scrub.sh's per-run outcome marker: "[ts] finished: OK"
-            if (preg_match('/finished:\s*(.+)$/', $line, $m)) {
-                $outcome = $m[1];
-            }
-            // scrub.sh's per-device start marker: "[ts] (1/2) scrubbing /dev/sdb".
-            // The next token must be an absolute device path (leading "/"):
-            // scrub-rs prints its own "scrubbing (recovery assessment +
-            // dry-run):" banner into the same log, and matching that would
-            // hand the page a bogus active device ("(recovery") whenever the
-            // live status server is unavailable (socket missing, e.g. the
-            // server failed to start).
-            if (preg_match('/scrubbing\s+(\/\S+)/', $line, $m)) {
-                $active = $m[1];
-            }
-        }
-        if ($cur !== null) { $blocks[] = $cur; }
-        fclose($fp);
+    $parsed = parse_scrub_log($run_log);
+    if ($parsed !== null) {
+        $blocks = $parsed['blocks'];
+        $outcome = $parsed['outcome'];
+        $active = $parsed['active'];
     }
 }
 
